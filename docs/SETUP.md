@@ -112,7 +112,7 @@
    - Python 仮想環境の有効化状態
    - `managed_components` 配下の取得状態
 
-## 7. カメラ有効化の基本設定
+## 7. PSRAM 有効化の具体手順（Freenove ESP32-S3 WROOM CAM）
 
 1. `menuconfig` を開く
 
@@ -120,16 +120,41 @@
    idf.py menuconfig
    ```
 
-2. 設定項目
-   - PSRAM 有効化
-   - カメラ用ピン設定（Freenove 仕様に合わせる）
-   - ログレベル設定（初期は `INFO` 推奨）
+2. PSRAM を有効化する
+   - `Component config` -> `Hardware Settings` -> `SPI RAM config` を開く
+   - `Support for external, SPI-connected RAM` を有効化する
+   - `SPI RAM type` は `Auto` で開始する
+   - `SPI RAM mode` は `Octal` または `OPI` を選ぶ（`quad_psram` は選ばない）
+   - `SPI RAM speed` は最初に `40MHz` を選ぶ（安定後に `80MHz` を検証）
 
-3. 保存後再ビルド
+3. Flash サイズを実機に合わせる
+   - `Serial flasher config` -> `Flash size` を `16MB` に設定する
+   - Freenove ESP32-S3 WROOM CAM は 16MB 構成が標準のため、2MB のままにしない
+
+4. 設定保存後に再ビルド・再書き込みする
 
    ```bash
    idf.py build
+   idf.py -p /dev/cu.usbmodem5AB90112901 flash monitor
    ```
+
+5. 起動ログで PSRAM 初期化成功を確認する
+   - `esp_psram: Found 8MB PSRAM device`
+   - `esp_psram: SPI SRAM memory test OK`
+   - アプリログで `PSRAM: init=1` と `PSRAM: total=8388608` が出ること
+
+6. Flash サイズ不一致警告が消えたことを確認する
+   - 次の警告が出ないことを確認する
+   - `Detected size(16384k) larger than the size in the binary image header(2048k)`
+
+7. 失敗時の切り分け
+   - `quad_psram: PSRAM chip is not connected, or wrong PSRAM line mode` が出た場合:
+     - `SPI RAM mode` を `Octal/OPI` 側に変更する
+   - 起動直後に `Failed to init external RAM!` で abort する場合:
+     - いったん `Support for external, SPI-connected RAM` を無効化して復旧する
+     - 復旧後にモジュール型番（`ESP32-S3-WROOM-1-N16R8` など）を確認し、再設定する
+   - `SPI Flash Size : 2MB` のままの場合:
+     - `Serial flasher config` の `Flash size` を再確認し、再書き込みする
 
 ## 8. 動作確認手順
 
