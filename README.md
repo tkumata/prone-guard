@@ -11,8 +11,9 @@ Freenove ESP32-S3 WROOM CAM を使い、乳児のうつ伏せ状態を検知し�
 ## 現在の状態
 
 - プロジェクト雛形を作成済み。
-- `main/main.c` は未実装。
-- ESP-DL 依存は `main/idf_component.yml` に追加済み。
+- `main/main.c` に Wi-Fi STA 接続、`GET /`、`GET /health` の最小実装を追加済み。
+- `GET /stream` は MJPEG 配信を実装済み（カメラ初期化失敗時のみ `503`）。
+- ESP-DL と `esp32-camera` 依存は `main/idf_component.yml` に追加済み。
 
 ## ドキュメント
 
