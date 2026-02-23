@@ -5,8 +5,6 @@ Freenove ESP32-S3 WROOM CAM を使い、顔認識可否を監視して状態を�
 現状は、`espressif/human_face_detect` コンポーネント（MSR+MNP）で顔認識可否のみを監視する実験コードです。
 うつ伏せ検知モデルは未実装のため、現時点の判定は顔検知ベースにとどまります。
 
-![sample](docs/assets/prone-guard-sample.png)
-
 ## 目的
 
 - ESP-IDF + ESP-DL でローカル推論を行う。
