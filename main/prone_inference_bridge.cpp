@@ -11,9 +11,17 @@
 
 static const char *TAG = "prone_inference";
 
-static HumanFaceDetect *s_detector;
+static human_face_detect::MSRMNP *s_detector;
 static prone_inference_status_t s_status = PRONE_INFERENCE_STATUS_NOT_READY;
 static int64_t s_last_decode_log_ms;
+static prone_face_box_t s_last_face_box = {
+    .x0 = -1,
+    .y0 = -1,
+    .x1 = -1,
+    .y1 = -1,
+    .confidence = 0.0f,
+    .valid = false,
+};
 
 esp_err_t prone_inference_init(void)
 {
@@ -22,7 +30,12 @@ esp_err_t prone_inference_init(void)
         return ESP_OK;
     }
 
-    s_detector = new HumanFaceDetect(HumanFaceDetect::MSRMNP_S8_V1, true);
+    s_detector = new human_face_detect::MSRMNP("human_face_detect_msr_s8_v1.espdl",
+                                               human_face_detect::MSR::default_score_thr,
+                                               human_face_detect::MSR::default_nms_thr,
+                                               "human_face_detect_mnp_s8_v1.espdl",
+                                               human_face_detect::MNP::default_score_thr,
+                                               human_face_detect::MNP::default_nms_thr);
     if (s_detector == nullptr) {
         s_status = PRONE_INFERENCE_STATUS_FAULT;
         ESP_LOGE(TAG, "HumanFaceDetect 初期化失敗");
@@ -36,7 +49,8 @@ esp_err_t prone_inference_init(void)
     s_detector->set_nms_thr(0.50f, 1);
 
     s_status = PRONE_INFERENCE_STATUS_OK;
-    ESP_LOGI(TAG, "推論モデル読み込み完了 detector=HumanFaceDetect(MSRMNP_S8_V1)");
+    ESP_LOGI(TAG,
+             "推論モデル読み込み完了 detector=MSRMNP files=[human_face_detect_msr_s8_v1.espdl,human_face_detect_mnp_s8_v1.espdl]");
     return ESP_OK;
 }
 
@@ -81,6 +95,13 @@ esp_err_t prone_inference_run_jpeg(const uint8_t *jpeg_data, size_t jpeg_len, bo
 
     *confidence = best;
     *is_face_detected = (best >= 0.50f);
+    s_last_face_box.x0 = best_x0;
+    s_last_face_box.y0 = best_y0;
+    s_last_face_box.x1 = best_x1;
+    s_last_face_box.y1 = best_y1;
+    s_last_face_box.confidence = best;
+    s_last_face_box.valid = (*is_face_detected) && (best_x0 >= 0) && (best_y0 >= 0) &&
+                            (best_x1 > best_x0) && (best_y1 > best_y0);
 
     int64_t now_ms = esp_timer_get_time() / 1000;
     if (now_ms - s_last_decode_log_ms >= 1000) {
@@ -104,4 +125,14 @@ esp_err_t prone_inference_run_jpeg(const uint8_t *jpeg_data, size_t jpeg_len, bo
 prone_inference_status_t prone_inference_get_status(void)
 {
     return s_status;
+}
+
+esp_err_t prone_inference_get_last_face_box(prone_face_box_t *out_box)
+{
+    if (out_box == nullptr) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    *out_box = s_last_face_box;
+    return ESP_OK;
 }

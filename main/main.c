@@ -78,9 +78,11 @@ static int64_t s_last_face_seen_ms = -1;
 static float s_last_face_confidence;
 static int64_t s_last_inference_ms;
 static int64_t s_last_face_log_ms;
+static prone_face_box_t s_last_face_box;
 
 static esp_err_t run_prone_inference(camera_fb_t *fb, bool *is_face_detected, float *confidence);
 static void update_face_monitor(bool is_face_detected, float confidence);
+static esp_err_t face_box_get_handler(httpd_req_t *req);
 
 static const char *state_to_string(system_state_t state)
 {
@@ -150,14 +152,39 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 {
     static const char html[] =
         "<!doctype html>"
-        "<html><head><meta charset=\"utf-8\"><title>顔認識監視</title></head>"
+        "<html><head><meta charset=\"utf-8\"><title>顔認識監視</title>"
+        "<style>"
+        "#wrap{position:relative;width:320px;height:240px;display:inline-block;}"
+        "#stream{width:320px;height:240px;display:block;}"
+        "#face-box{position:absolute;border:2px solid red;display:none;pointer-events:none;box-sizing:border-box;}"
+        "</style>"
+        "</head>"
         "<body>"
         "<h1>顔認識監視</h1>"
+        "<div id=\"wrap\">"
         "<img src=\"http://\" onerror=\"this.outerHTML='<p>stream 読み込み失敗</p>'\" id=\"stream\" alt=\"stream\" width=\"320\" height=\"240\">"
+        "<div id=\"face-box\"></div>"
+        "</div>"
         "<p>状態確認: <a href=\"/health\">/health</a></p>"
+        "<p>枠座標: <a href=\"/face_box\">/face_box</a></p>"
         "<script>"
         "const img=document.getElementById('stream');"
+        "const box=document.getElementById('face-box');"
         "img.src='http://'+location.hostname+':81/stream';"
+        "const clamp=(v,min,max)=>Math.min(max,Math.max(min,v));"
+        "setInterval(async()=>{"
+        "try{"
+        "const r=await fetch('/face_box',{cache:'no-store'});"
+        "if(!r.ok){box.style.display='none';return;}"
+        "const d=await r.json();"
+        "if(!d.detected){box.style.display='none';return;}"
+        "const x0=clamp(d.x0,0,319),y0=clamp(d.y0,0,239),x1=clamp(d.x1,0,319),y1=clamp(d.y1,0,239);"
+        "if(x1<=x0||y1<=y0){box.style.display='none';return;}"
+        "box.style.left=x0+'px';box.style.top=y0+'px';"
+        "box.style.width=(x1-x0)+'px';box.style.height=(y1-y0)+'px';"
+        "box.style.display='block';"
+        "}catch(e){box.style.display='none';}"
+        "},200);"
         "</script>"
         "</body></html>";
 
@@ -182,6 +209,46 @@ static esp_err_t health_get_handler(httpd_req_t *req)
                            inference_status,
                            s_is_face_detected ? "true" : "false",
                            (double)s_face_confidence);
+    if (written < 0 || written >= (int)sizeof(json)) {
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t face_box_get_handler(httpd_req_t *req)
+{
+    char json[192];
+    prone_face_box_t box = s_last_face_box;
+    bool detected = s_is_face_detected && box.valid;
+    if (detected) {
+        if (box.x0 < 0) {
+            box.x0 = 0;
+        }
+        if (box.y0 < 0) {
+            box.y0 = 0;
+        }
+        if (box.x1 > 319) {
+            box.x1 = 319;
+        }
+        if (box.y1 > 239) {
+            box.y1 = 239;
+        }
+        if (box.x1 <= box.x0 || box.y1 <= box.y0) {
+            detected = false;
+        }
+    }
+
+    int written = snprintf(json,
+                           sizeof(json),
+                           "{\"detected\":%s,\"x0\":%d,\"y0\":%d,\"x1\":%d,\"y1\":%d,\"confidence\":%.3f}",
+                           detected ? "true" : "false",
+                           detected ? box.x0 : -1,
+                           detected ? box.y0 : -1,
+                           detected ? box.x1 : -1,
+                           detected ? box.y1 : -1,
+                           (double)(detected ? box.confidence : 0.0f));
     if (written < 0 || written >= (int)sizeof(json)) {
         return ESP_FAIL;
     }
@@ -264,6 +331,11 @@ static esp_err_t run_prone_inference(camera_fb_t *fb, bool *is_face_detected, fl
     }
 
     esp_err_t err = prone_inference_run_jpeg(fb->buf, fb->len, is_face_detected, confidence);
+    if (err == ESP_OK) {
+        prone_inference_get_last_face_box(&s_last_face_box);
+    } else {
+        s_last_face_box.valid = false;
+    }
     s_inference_status = from_bridge_status(prone_inference_get_status());
     return err;
 }
@@ -348,9 +420,16 @@ static esp_err_t start_http_server(void)
         .handler = health_get_handler,
         .user_ctx = NULL,
     };
+    const httpd_uri_t face_box_uri = {
+        .uri = "/face_box",
+        .method = HTTP_GET,
+        .handler = face_box_get_handler,
+        .user_ctx = NULL,
+    };
 
     httpd_register_uri_handler(s_http_server, &root_uri);
     httpd_register_uri_handler(s_http_server, &health_uri);
+    httpd_register_uri_handler(s_http_server, &face_box_uri);
 
     ESP_LOGI(TAG, "HTTP サーバ開始");
     return ESP_OK;
