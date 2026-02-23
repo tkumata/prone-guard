@@ -21,7 +21,7 @@
    - `prone_judge`: 連続時間判定を行い、`MONITORING` と `ALERT` を決定する。
 
 5. 描画層
-   - `overlay_renderer`: `ALERT` 時のみ赤い四角を JPEG へ描画する。
+   - `overlay_renderer`: 顔検知成立時に赤い四角を JPEG へ描画する。
 
 6. 配信層
    - `http_stream_server`: HTML と MJPEG ストリームを配信する。

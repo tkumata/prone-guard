@@ -1,10 +1,10 @@
-# 乳児うつ伏せ検知デバイス 仕様書
+# 顔認識監視デバイス 仕様書
 
 ## 1. 対象機能
 
 - ESP32-S3 上の HTTP 映像配信
-- ESP-DL によるうつ伏せ推論
-- うつ伏せ継続検知時の赤枠オーバーレイ
+- ESP-DL による顔認識推論
+- 顔未認識時の障害遷移
 
 ## 2. 設定仕様
 
@@ -16,14 +16,14 @@
    - `FRAME_WIDTH = 320`
    - `FRAME_HEIGHT = 240`
    - `FRAME_INTERVAL_MS = 500`
-   - `PRONE_CONFIDENCE_TH = 0.70`
-   - `PRONE_HOLD_SEC = 10`
+   - `FACE_CONFIDENCE_TH = 0.50`
+   - `FACE_MISS_FAULT_SEC = 3`
    - `WIFI_RETRY_INTERVAL_SEC = 5`
 
 3. 境界値
    - `FRAME_INTERVAL_MS`: 200 〜 1000
-   - `PRONE_CONFIDENCE_TH`: 0.50 〜 0.95
-   - `PRONE_HOLD_SEC`: 3 〜 30
+   - `FACE_CONFIDENCE_TH`: 0.50 〜 0.95
+   - `FACE_MISS_FAULT_SEC`: 1 〜 10
 
 ## 3. HTTP 仕様
 
@@ -36,8 +36,8 @@
    - 役割: MJPEG ストリーム配信
    - 応答: `multipart/x-mixed-replace; boundary=frame`
    - フレーム内容:
-     - 通常時: 元画像
-     - `ALERT` 時: 赤枠描画済み画像
+     - 顔検知成立時は検知領域に赤枠を重畳した JPEG を配信する
+     - 顔未検知時、または描画失敗時は元画像を配信する
 
 3. `GET /health`
    - 役割: 状態確認
@@ -56,35 +56,33 @@
 ## 4. 推論仕様
 
 - 入力: カメラフレームをモデル入力サイズへ前処理したデータ
+- 利用モデル:
+  - `human_face_detect_msr_s8_v1.espdl`
+  - `human_face_detect_mnp_s8_v1.espdl`
 - 出力:
-  - `is_prone` (`true` / `false`)
+  - `is_face_detected` (`true` / `false`)
   - `confidence` (0.0 〜 1.0)
-  - `box` (`x`, `y`, `w`, `h`)
 - 判定:
-  - `confidence >= PRONE_CONFIDENCE_TH` かつ `is_prone == true` を検知候補とする。
+  - `confidence >= FACE_CONFIDENCE_TH` かつ `is_face_detected == true` を正常候補とする。
 
-## 5. 継続判定仕様
+## 5. 監視判定仕様
 
-1. 検知開始
-   - 初回検知候補で `prone_started_ms` を記録する。
+1. 正常判定
+   - `confidence >= FACE_CONFIDENCE_TH` かつ `is_face_detected == true` を正常とみなす。
 
-2. 警告成立
-   - `now_ms - prone_started_ms >= PRONE_HOLD_SEC * 1000` で `ALERT` へ遷移する。
+2. 障害成立
+   - 非正常状態が `FACE_MISS_FAULT_SEC` 秒継続で `FAULT_INFERENCE` に遷移する。
 
-3. 警告解除
-   - 非検知状態が 3 秒継続で `MONITORING` に戻す。
-
-4. 失敗時
-   - 推論失敗フレームは継続判定に含めない。
+3. 障害解除
+   - 正常判定を再取得したフレームで `MONITORING` に戻す。
 
 ## 6. 描画仕様
 
-- 色: RGB888 `#FF0000`
-- 線幅: 2px（疑似値。実装時は描画関数に合わせる）
-- 描画条件: `ALERT` かつ `box` が有効範囲内
-- 範囲外座標:
-  - `x < 0` や `y < 0` は 0 に丸める。
-  - `x + w`、`y + h` が画面外の場合は端で切り詰める。
+- 描画条件: `is_face_detected == true` かつ顔矩形が有効な場合
+- 描画色: RGB(255,0,0)
+- 線幅: 2px
+- 描画範囲: 推論結果の顔矩形をフレーム境界内にクリップした領域
+- 失敗時: 描画なしで元 JPEG を返し、配信は継続する
 
 ## 7. 状態遷移仕様
 
@@ -92,16 +90,14 @@
 - `BOOT -> WIFI_CONNECTING`
 - `WIFI_CONNECTING -> READY`
 - `READY -> MONITORING`
-- `MONITORING -> ALERT`
-- `ALERT -> MONITORING`
-- `MONITORING/ALERT -> FAULT_CAMERA`
-- `MONITORING/ALERT -> FAULT_INFERENCE`
+- `MONITORING -> FAULT_INFERENCE`
+- `FAULT_INFERENCE -> MONITORING`
+- `MONITORING/FAULT_INFERENCE -> FAULT_CAMERA`
 
 禁止遷移:
 
-- `BOOT -> ALERT`
-- `FAULT_CAMERA -> ALERT`
-- `FAULT_INFERENCE -> ALERT`
+- `BOOT -> FAULT_INFERENCE`
+- `FAULT_CAMERA -> MONITORING`
 
 ## 8. エラー仕様
 
@@ -116,9 +112,9 @@
    - 影響: 画像配信停止
 
 3. 推論
-   - 条件: 推論失敗連続 10 回
+   - 条件: 顔が `FACE_MISS_FAULT_SEC` 秒以上認識できない
    - 挙動: `FAULT_INFERENCE` へ遷移
-   - 影響: 赤枠表示停止、映像配信のみ継続
+   - 影響: 映像配信は継続し、`/health` で障害状態を返す
 
 ## 9. 互換性と移行
 
