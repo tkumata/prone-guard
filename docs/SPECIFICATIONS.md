@@ -16,7 +16,7 @@
    - `FRAME_WIDTH = 320`
    - `FRAME_HEIGHT = 240`
    - `FRAME_INTERVAL_MS = 500`
-   - `FACE_CONFIDENCE_TH = 0.70`
+   - `FACE_CONFIDENCE_TH = 0.50`
    - `FACE_MISS_FAULT_SEC = 3`
    - `WIFI_RETRY_INTERVAL_SEC = 5`
 
@@ -36,7 +36,8 @@
    - 役割: MJPEG ストリーム配信
    - 応答: `multipart/x-mixed-replace; boundary=frame`
    - フレーム内容:
-     - 常に元画像を配信する
+     - 顔検知成立時は検知領域に赤枠を重畳した JPEG を配信する
+     - 顔未検知時、または描画失敗時は元画像を配信する
 
 3. `GET /health`
    - 役割: 状態確認
@@ -55,6 +56,9 @@
 ## 4. 推論仕様
 
 - 入力: カメラフレームをモデル入力サイズへ前処理したデータ
+- 利用モデル:
+  - `human_face_detect_msr_s8_v1.espdl`
+  - `human_face_detect_mnp_s8_v1.espdl`
 - 出力:
   - `is_face_detected` (`true` / `false`)
   - `confidence` (0.0 〜 1.0)
@@ -74,8 +78,11 @@
 
 ## 6. 描画仕様
 
-- 推論結果に応じたオーバーレイ描画は行わない。
-- `/stream` はカメラ JPEG をそのまま返す。
+- 描画条件: `is_face_detected == true` かつ顔矩形が有効な場合
+- 描画色: RGB(255,0,0)
+- 線幅: 2px
+- 描画範囲: 推論結果の顔矩形をフレーム境界内にクリップした領域
+- 失敗時: 描画なしで元 JPEG を返し、配信は継続する
 
 ## 7. 状態遷移仕様
 

@@ -18,7 +18,8 @@ Freenove ESP32-S3 WROOM CAM を使い、顔認識可否を監視して状態を�
 - `main/main.c` に Wi-Fi STA 接続、`GET /`、`GET /health` の最小実装を追加済み。
 - `GET /stream` は MJPEG 配信を実装済み（カメラ初期化失敗時のみ `503`）。
 - 顔認識の状態遷移ロジック（3秒間顔未認識で `FAULT_INFERENCE`、再認識で `MONITORING`）は実装済み。
-- `main/prone_inference_bridge.cpp` で `HumanFaceDetect(MSRMNP_S8_V1)` を用いた推論実装を追加済み。
+- 顔検知成立時のみ、検知領域へ赤枠を重畳して `/stream` に配信する。
+- `main/prone_inference_bridge.cpp` で `human_face_detect_msr_s8_v1.espdl` と `human_face_detect_mnp_s8_v1.espdl` の2モデルを用いた推論実装を追加済み。
 - ESP-DL と `esp32-camera` 依存は `main/idf_component.yml` に追加済み。
 
 ## ドキュメント
