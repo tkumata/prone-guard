@@ -2,6 +2,10 @@
 
 Freenove ESP32-S3 WROOM CAM を使い、乳児のうつ伏せ状態を検知してブラウザ映像上に赤枠を重畳表示するプロジェクトです。
 
+現状は、うつ伏せ推論モデルがないので、テキトーなモデルにアクセスするだけのコード。
+
+![sample](docs/assets/prone-guard-sample.png)
+
 ## 目的
 
 - ESP-IDF + ESP-DL でローカル推論を行う。
