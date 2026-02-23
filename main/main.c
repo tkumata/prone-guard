@@ -13,12 +13,17 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "nvs_flash.h"
+#include "prone_inference_bridge.h"
 
 #define WIFI_SSID "Rakuten-EBBB"
 #define WIFI_PASSWORD "8X62VENBT2"
 
 #define WIFI_RETRY_INTERVAL_MS 5000
 #define WIFI_CONNECTED_BIT BIT0
+#define FRAME_INTERVAL_MS 500
+#define PRONE_CONFIDENCE_TH 0.70f
+#define PRONE_HOLD_MS (10 * 1000)
+#define PRONE_RELEASE_MS (3 * 1000)
 
 // Freenove ESP32-S3 WROOM CAM (OV2640) 想定ピン定義
 #define CAM_PIN_PWDN -1
@@ -50,13 +55,30 @@ typedef enum {
     SYSTEM_STATE_FAULT_INFERENCE,
 } system_state_t;
 
+typedef enum {
+    INFERENCE_STATUS_NOT_READY = 0,
+    INFERENCE_STATUS_OK,
+    INFERENCE_STATUS_MODEL_MISSING,
+    INFERENCE_STATUS_FAULT,
+} inference_status_t;
+
 static EventGroupHandle_t s_wifi_event_group;
 static httpd_handle_t s_http_server;
+static httpd_handle_t s_stream_http_server;
 static system_state_t s_system_state = SYSTEM_STATE_BOOT;
 static bool s_wifi_connected;
 static int64_t s_last_wifi_retry_ms;
 static esp_timer_handle_t s_wifi_retry_timer;
 static bool s_camera_ready;
+static inference_status_t s_inference_status = INFERENCE_STATUS_NOT_READY;
+static bool s_is_prone;
+static float s_prone_confidence;
+static int64_t s_prone_started_ms = -1;
+static int64_t s_non_prone_started_ms = -1;
+static int64_t s_last_inference_ms;
+
+static esp_err_t run_prone_inference(camera_fb_t *fb, bool *is_prone, float *confidence);
+static void update_prone_judge(bool is_prone, float confidence);
 
 static const char *state_to_string(system_state_t state)
 {
@@ -80,6 +102,38 @@ static const char *state_to_string(system_state_t state)
     }
 }
 
+static const char *inference_status_to_string(inference_status_t status)
+{
+    switch (status) {
+    case INFERENCE_STATUS_NOT_READY:
+        return "not_ready";
+    case INFERENCE_STATUS_OK:
+        return "ok";
+    case INFERENCE_STATUS_MODEL_MISSING:
+        return "model_missing";
+    case INFERENCE_STATUS_FAULT:
+        return "fault";
+    default:
+        return "unknown";
+    }
+}
+
+static inference_status_t from_bridge_status(prone_inference_status_t status)
+{
+    switch (status) {
+    case PRONE_INFERENCE_STATUS_NOT_READY:
+        return INFERENCE_STATUS_NOT_READY;
+    case PRONE_INFERENCE_STATUS_OK:
+        return INFERENCE_STATUS_OK;
+    case PRONE_INFERENCE_STATUS_MODEL_MISSING:
+        return INFERENCE_STATUS_MODEL_MISSING;
+    case PRONE_INFERENCE_STATUS_FAULT:
+        return INFERENCE_STATUS_FAULT;
+    default:
+        return INFERENCE_STATUS_FAULT;
+    }
+}
+
 static void set_system_state(system_state_t next_state)
 {
     if (s_system_state == next_state) {
@@ -97,8 +151,12 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "<html><head><meta charset=\"utf-8\"><title>うつ伏せ監視</title></head>"
         "<body>"
         "<h1>うつ伏せ監視</h1>"
-        "<img src=\"/stream\" alt=\"stream\" width=\"320\" height=\"240\">"
+        "<img src=\"http://\" onerror=\"this.outerHTML='<p>stream 読み込み失敗</p>'\" id=\"stream\" alt=\"stream\" width=\"320\" height=\"240\">"
         "<p>状態確認: <a href=\"/health\">/health</a></p>"
+        "<script>"
+        "const img=document.getElementById('stream');"
+        "img.src='http://'+location.hostname+':81/stream';"
+        "</script>"
         "</body></html>";
 
     httpd_resp_set_type(req, "text/html");
@@ -107,16 +165,18 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 
 static esp_err_t health_get_handler(httpd_req_t *req)
 {
-    char json[160];
+    char json[192];
     const char *wifi_status = s_wifi_connected ? "connected" : "disconnected";
     const char *camera_status = s_camera_ready ? "ok" : "fault";
+    const char *inference_status = inference_status_to_string(s_inference_status);
 
     int written = snprintf(json,
                            sizeof(json),
-                           "{\"state\":\"%s\",\"wifi\":\"%s\",\"camera\":\"%s\",\"inference\":\"not_ready\"}",
+                           "{\"state\":\"%s\",\"wifi\":\"%s\",\"camera\":\"%s\",\"inference\":\"%s\"}",
                            state_to_string(s_system_state),
                            wifi_status,
-                           camera_status);
+                           camera_status,
+                           inference_status);
     if (written < 0 || written >= (int)sizeof(json)) {
         return ESP_FAIL;
     }
@@ -147,6 +207,18 @@ static esp_err_t stream_get_handler(httpd_req_t *req)
         if (fb == NULL) {
             ESP_LOGW(TAG, "カメラフレーム取得失敗");
             continue;
+        }
+
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms - s_last_inference_ms >= FRAME_INTERVAL_MS) {
+            s_last_inference_ms = now_ms;
+            esp_err_t infer_err = run_prone_inference(fb, &s_is_prone, &s_prone_confidence);
+            if (infer_err == ESP_OK) {
+                s_inference_status = INFERENCE_STATUS_OK;
+            } else if (infer_err != ESP_ERR_NOT_FOUND) {
+                s_inference_status = INFERENCE_STATUS_FAULT;
+            }
+            update_prone_judge(s_is_prone, s_prone_confidence);
         }
 
         int hlen = snprintf(part_header,
@@ -180,6 +252,44 @@ static esp_err_t stream_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t run_prone_inference(camera_fb_t *fb, bool *is_prone, float *confidence)
+{
+    if (fb == NULL || is_prone == NULL || confidence == NULL) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    esp_err_t err = prone_inference_run_jpeg(fb->buf, fb->len, is_prone, confidence);
+    s_inference_status = from_bridge_status(prone_inference_get_status());
+    return err;
+}
+
+static void update_prone_judge(bool is_prone, float confidence)
+{
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    bool candidate = is_prone && (confidence >= PRONE_CONFIDENCE_TH);
+
+    if (candidate) {
+        s_non_prone_started_ms = -1;
+        if (s_prone_started_ms < 0) {
+            s_prone_started_ms = now_ms;
+        }
+
+        if ((now_ms - s_prone_started_ms) >= PRONE_HOLD_MS && s_system_state == SYSTEM_STATE_MONITORING) {
+            set_system_state(SYSTEM_STATE_ALERT);
+        }
+        return;
+    }
+
+    s_prone_started_ms = -1;
+    if (s_non_prone_started_ms < 0) {
+        s_non_prone_started_ms = now_ms;
+    }
+
+    if ((now_ms - s_non_prone_started_ms) >= PRONE_RELEASE_MS && s_system_state == SYSTEM_STATE_ALERT) {
+        set_system_state(SYSTEM_STATE_MONITORING);
+    }
+}
+
 static esp_err_t start_http_server(void)
 {
     if (s_http_server != NULL) {
@@ -202,13 +312,6 @@ static esp_err_t start_http_server(void)
         .user_ctx = NULL,
     };
 
-    const httpd_uri_t stream_uri = {
-        .uri = "/stream",
-        .method = HTTP_GET,
-        .handler = stream_get_handler,
-        .user_ctx = NULL,
-    };
-
     const httpd_uri_t health_uri = {
         .uri = "/health",
         .method = HTTP_GET,
@@ -217,10 +320,37 @@ static esp_err_t start_http_server(void)
     };
 
     httpd_register_uri_handler(s_http_server, &root_uri);
-    httpd_register_uri_handler(s_http_server, &stream_uri);
     httpd_register_uri_handler(s_http_server, &health_uri);
 
     ESP_LOGI(TAG, "HTTP サーバ開始");
+    return ESP_OK;
+}
+
+static esp_err_t start_stream_http_server(void)
+{
+    if (s_stream_http_server != NULL) {
+        return ESP_OK;
+    }
+
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.server_port = 81;
+    config.ctrl_port = 32769;
+    config.lru_purge_enable = true;
+
+    esp_err_t err = httpd_start(&s_stream_http_server, &config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "ストリームサーバ開始失敗: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    const httpd_uri_t stream_uri = {
+        .uri = "/stream",
+        .method = HTTP_GET,
+        .handler = stream_get_handler,
+        .user_ctx = NULL,
+    };
+    httpd_register_uri_handler(s_stream_http_server, &stream_uri);
+    ESP_LOGI(TAG, "ストリームサーバ開始 port=81");
     return ESP_OK;
 }
 
@@ -323,6 +453,7 @@ static esp_err_t start_wifi_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     s_last_wifi_retry_ms = 0;
+    s_last_inference_ms = 0;
 
     const esp_timer_create_args_t timer_args = {
         .callback = wifi_retry_timer_cb,
@@ -399,7 +530,17 @@ void app_main(void)
         if (cam_err != ESP_OK) {
             ESP_LOGW(TAG, "カメラが未準備のため /stream は 503 を返します");
         }
+
+        esp_err_t infer_init_err = prone_inference_init();
+        if (infer_init_err != ESP_OK) {
+            s_inference_status = from_bridge_status(prone_inference_get_status());
+            ESP_LOGW(TAG, "推論初期化未完了: %s", esp_err_to_name(infer_init_err));
+        } else {
+            s_inference_status = INFERENCE_STATUS_OK;
+        }
+
         ESP_ERROR_CHECK(start_http_server());
+        ESP_ERROR_CHECK(start_stream_http_server());
         if (s_camera_ready) {
             set_system_state(SYSTEM_STATE_MONITORING);
         }
