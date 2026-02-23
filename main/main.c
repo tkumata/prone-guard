@@ -21,9 +21,9 @@
 #define WIFI_RETRY_INTERVAL_MS 5000
 #define WIFI_CONNECTED_BIT BIT0
 #define FRAME_INTERVAL_MS 500
-#define PRONE_CONFIDENCE_TH 0.70f
-#define PRONE_HOLD_MS (10 * 1000)
-#define PRONE_RELEASE_MS (3 * 1000)
+#define FACE_CONFIDENCE_TH 0.50f
+#define FACE_DETECT_HOLD_MS (1500)
+#define FACE_MISS_FAULT_MS (3 * 1000)
 
 // Freenove ESP32-S3 WROOM CAM (OV2640) 想定ピン定義
 #define CAM_PIN_PWDN -1
@@ -71,14 +71,16 @@ static int64_t s_last_wifi_retry_ms;
 static esp_timer_handle_t s_wifi_retry_timer;
 static bool s_camera_ready;
 static inference_status_t s_inference_status = INFERENCE_STATUS_NOT_READY;
-static bool s_is_prone;
-static float s_prone_confidence;
-static int64_t s_prone_started_ms = -1;
-static int64_t s_non_prone_started_ms = -1;
+static bool s_is_face_detected;
+static float s_face_confidence;
+static int64_t s_face_missing_started_ms = -1;
+static int64_t s_last_face_seen_ms = -1;
+static float s_last_face_confidence;
 static int64_t s_last_inference_ms;
+static int64_t s_last_face_log_ms;
 
-static esp_err_t run_prone_inference(camera_fb_t *fb, bool *is_prone, float *confidence);
-static void update_prone_judge(bool is_prone, float confidence);
+static esp_err_t run_prone_inference(camera_fb_t *fb, bool *is_face_detected, float *confidence);
+static void update_face_monitor(bool is_face_detected, float confidence);
 
 static const char *state_to_string(system_state_t state)
 {
@@ -148,9 +150,9 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 {
     static const char html[] =
         "<!doctype html>"
-        "<html><head><meta charset=\"utf-8\"><title>うつ伏せ監視</title></head>"
+        "<html><head><meta charset=\"utf-8\"><title>顔認識監視</title></head>"
         "<body>"
-        "<h1>うつ伏せ監視</h1>"
+        "<h1>顔認識監視</h1>"
         "<img src=\"http://\" onerror=\"this.outerHTML='<p>stream 読み込み失敗</p>'\" id=\"stream\" alt=\"stream\" width=\"320\" height=\"240\">"
         "<p>状態確認: <a href=\"/health\">/health</a></p>"
         "<script>"
@@ -165,18 +167,21 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 
 static esp_err_t health_get_handler(httpd_req_t *req)
 {
-    char json[192];
+    char json[256];
     const char *wifi_status = s_wifi_connected ? "connected" : "disconnected";
     const char *camera_status = s_camera_ready ? "ok" : "fault";
     const char *inference_status = inference_status_to_string(s_inference_status);
 
     int written = snprintf(json,
                            sizeof(json),
-                           "{\"state\":\"%s\",\"wifi\":\"%s\",\"camera\":\"%s\",\"inference\":\"%s\"}",
+                           "{\"state\":\"%s\",\"wifi\":\"%s\",\"camera\":\"%s\",\"inference\":\"%s\","
+                           "\"face_detected\":%s,\"face_confidence\":%.3f}",
                            state_to_string(s_system_state),
                            wifi_status,
                            camera_status,
-                           inference_status);
+                           inference_status,
+                           s_is_face_detected ? "true" : "false",
+                           (double)s_face_confidence);
     if (written < 0 || written >= (int)sizeof(json)) {
         return ESP_FAIL;
     }
@@ -212,13 +217,13 @@ static esp_err_t stream_get_handler(httpd_req_t *req)
         int64_t now_ms = esp_timer_get_time() / 1000;
         if (now_ms - s_last_inference_ms >= FRAME_INTERVAL_MS) {
             s_last_inference_ms = now_ms;
-            esp_err_t infer_err = run_prone_inference(fb, &s_is_prone, &s_prone_confidence);
+            esp_err_t infer_err = run_prone_inference(fb, &s_is_face_detected, &s_face_confidence);
             if (infer_err == ESP_OK) {
                 s_inference_status = INFERENCE_STATUS_OK;
             } else if (infer_err != ESP_ERR_NOT_FOUND) {
                 s_inference_status = INFERENCE_STATUS_FAULT;
             }
-            update_prone_judge(s_is_prone, s_prone_confidence);
+            update_face_monitor(s_is_face_detected, s_face_confidence);
         }
 
         int hlen = snprintf(part_header,
@@ -252,41 +257,66 @@ static esp_err_t stream_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
-static esp_err_t run_prone_inference(camera_fb_t *fb, bool *is_prone, float *confidence)
+static esp_err_t run_prone_inference(camera_fb_t *fb, bool *is_face_detected, float *confidence)
 {
-    if (fb == NULL || is_prone == NULL || confidence == NULL) {
+    if (fb == NULL || is_face_detected == NULL || confidence == NULL) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    esp_err_t err = prone_inference_run_jpeg(fb->buf, fb->len, is_prone, confidence);
+    esp_err_t err = prone_inference_run_jpeg(fb->buf, fb->len, is_face_detected, confidence);
     s_inference_status = from_bridge_status(prone_inference_get_status());
     return err;
 }
 
-static void update_prone_judge(bool is_prone, float confidence)
+static void update_face_monitor(bool is_face_detected, float confidence)
 {
     int64_t now_ms = esp_timer_get_time() / 1000;
-    bool candidate = is_prone && (confidence >= PRONE_CONFIDENCE_TH);
+    bool raw_face_ok = is_face_detected && (confidence >= FACE_CONFIDENCE_TH);
 
-    if (candidate) {
-        s_non_prone_started_ms = -1;
-        if (s_prone_started_ms < 0) {
-            s_prone_started_ms = now_ms;
-        }
+    if (raw_face_ok) {
+        s_last_face_seen_ms = now_ms;
+        s_last_face_confidence = confidence;
+    }
 
-        if ((now_ms - s_prone_started_ms) >= PRONE_HOLD_MS && s_system_state == SYSTEM_STATE_MONITORING) {
-            set_system_state(SYSTEM_STATE_ALERT);
+    bool face_ok = raw_face_ok;
+    if (!face_ok && s_last_face_seen_ms >= 0 && (now_ms - s_last_face_seen_ms) <= FACE_DETECT_HOLD_MS) {
+        face_ok = true;
+        is_face_detected = true;
+        confidence = s_last_face_confidence;
+    }
+
+    s_is_face_detected = face_ok;
+    s_face_confidence = face_ok ? confidence : 0.0f;
+
+    if (now_ms - s_last_face_log_ms >= 1000) {
+        s_last_face_log_ms = now_ms;
+        ESP_LOGI(TAG,
+                 "face monitor: detected=%d confidence=%.3f raw_ok=%d hold_ms=%d threshold=%.2f state=%s",
+                 s_is_face_detected ? 1 : 0,
+                 (double)s_face_confidence,
+                 raw_face_ok ? 1 : 0,
+                 (int)FACE_DETECT_HOLD_MS,
+                 (double)FACE_CONFIDENCE_TH,
+                 state_to_string(s_system_state));
+    }
+
+    if (face_ok) {
+        s_face_missing_started_ms = -1;
+        if (s_system_state == SYSTEM_STATE_FAULT_INFERENCE && s_camera_ready) {
+            set_system_state(SYSTEM_STATE_MONITORING);
         }
         return;
     }
 
-    s_prone_started_ms = -1;
-    if (s_non_prone_started_ms < 0) {
-        s_non_prone_started_ms = now_ms;
+    if (s_face_missing_started_ms < 0) {
+        s_face_missing_started_ms = now_ms;
     }
 
-    if ((now_ms - s_non_prone_started_ms) >= PRONE_RELEASE_MS && s_system_state == SYSTEM_STATE_ALERT) {
-        set_system_state(SYSTEM_STATE_MONITORING);
+    if ((now_ms - s_face_missing_started_ms) >= FACE_MISS_FAULT_MS) {
+        s_inference_status = INFERENCE_STATUS_FAULT;
+        if (s_system_state != SYSTEM_STATE_FAULT_CAMERA) {
+            set_system_state(SYSTEM_STATE_FAULT_INFERENCE);
+        }
     }
 }
 

@@ -1,163 +1,52 @@
 #include "prone_inference_bridge.h"
 
-#include <math.h>
-#include <map>
-#include <string.h>
-#include <string>
-#include <vector>
+#include <stdint.h>
 
 #include "dl_image_define.hpp"
 #include "dl_image_jpeg.hpp"
-#include "dl_image_preprocessor.hpp"
-#include "dl_model_base.hpp"
-#include "dl_tensor_base.hpp"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_timer.h"
+#include "human_face_detect.hpp"
 
 static const char *TAG = "prone_inference";
 
-extern const uint8_t _binary_prone_espdl_start[] asm("_binary_prone_espdl_start");
-extern const uint8_t _binary_prone_espdl_end[] asm("_binary_prone_espdl_end");
-
-static dl::Model *s_model;
-static dl::image::ImagePreprocessor *s_preprocessor;
+static HumanFaceDetect *s_detector;
 static prone_inference_status_t s_status = PRONE_INFERENCE_STATUS_NOT_READY;
-static std::string s_input_name;
-static std::string s_output_name;
-
-static dl::TensorBase *get_first_input(dl::Model *model, std::string *name)
-{
-    std::map<std::string, dl::TensorBase *> &inputs = model->get_inputs();
-    if (inputs.empty()) {
-        return nullptr;
-    }
-    auto it = inputs.begin();
-    if (name != nullptr) {
-        *name = it->first;
-    }
-    return it->second;
-}
-
-static dl::TensorBase *get_first_output(dl::Model *model, std::string *name)
-{
-    std::map<std::string, dl::TensorBase *> &outputs = model->get_outputs();
-    if (outputs.empty()) {
-        return nullptr;
-    }
-    auto it = outputs.begin();
-    if (name != nullptr) {
-        *name = it->first;
-    }
-    return it->second;
-}
-
-static float read_tensor_value(dl::TensorBase *tensor, int index)
-{
-    if (index < 0 || index >= tensor->get_size()) {
-        return 0.0f;
-    }
-
-    switch (tensor->get_dtype()) {
-    case dl::DATA_TYPE_FLOAT:
-        return tensor->get_element_ptr<float>()[index];
-    case dl::DATA_TYPE_INT8:
-        return dl::dequantize<int8_t, float>(tensor->get_element_ptr<int8_t>()[index], DL_SCALE(tensor->get_exponent()));
-    case dl::DATA_TYPE_INT16:
-        return dl::dequantize<int16_t, float>(tensor->get_element_ptr<int16_t>()[index],
-                                              DL_SCALE(tensor->get_exponent()));
-    case dl::DATA_TYPE_UINT8:
-        return (float)tensor->get_element_ptr<uint8_t>()[index];
-    case dl::DATA_TYPE_UINT16:
-        return (float)tensor->get_element_ptr<uint16_t>()[index];
-    case dl::DATA_TYPE_INT32:
-        return (float)tensor->get_element_ptr<int32_t>()[index];
-    default:
-        return 0.0f;
-    }
-}
-
-static void decode_output(dl::TensorBase *output, bool *is_prone, float *confidence)
-{
-    int output_size = output->get_size();
-    if (output_size >= 2) {
-        float non_prone_logit = read_tensor_value(output, 0);
-        float prone_logit = read_tensor_value(output, 1);
-        float max_logit = (non_prone_logit > prone_logit) ? non_prone_logit : prone_logit;
-        float exp0 = expf(non_prone_logit - max_logit);
-        float exp1 = expf(prone_logit - max_logit);
-        float denom = exp0 + exp1;
-        *confidence = (denom > 0.0f) ? (exp1 / denom) : 0.0f;
-        *is_prone = prone_logit >= non_prone_logit;
-        return;
-    }
-
-    float score = read_tensor_value(output, 0);
-    *confidence = 1.0f / (1.0f + expf(-score));
-    *is_prone = *confidence >= 0.5f;
-}
+static int64_t s_last_decode_log_ms;
 
 esp_err_t prone_inference_init(void)
 {
-    if (s_model != nullptr && s_preprocessor != nullptr) {
+    if (s_detector != nullptr) {
         s_status = PRONE_INFERENCE_STATUS_OK;
         return ESP_OK;
     }
 
-    const uint8_t *model_start = &_binary_prone_espdl_start[0];
-    const uint8_t *model_end = &_binary_prone_espdl_end[0];
-    if (model_end <= model_start) {
-        s_status = PRONE_INFERENCE_STATUS_MODEL_MISSING;
-        ESP_LOGE(TAG, "prone.espdl が埋め込まれていません");
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    s_model = new dl::Model((const char *)model_start);
-    if (s_model == nullptr) {
+    s_detector = new HumanFaceDetect(HumanFaceDetect::MSRMNP_S8_V1, true);
+    if (s_detector == nullptr) {
         s_status = PRONE_INFERENCE_STATUS_FAULT;
+        ESP_LOGE(TAG, "HumanFaceDetect 初期化失敗");
         return ESP_ERR_NO_MEM;
     }
 
-    dl::TensorBase *input = get_first_input(s_model, &s_input_name);
-    if (input == nullptr || input->shape.size() < 4) {
-        s_status = PRONE_INFERENCE_STATUS_FAULT;
-        ESP_LOGE(TAG, "モデル入力形状が不正です");
-        return ESP_FAIL;
-    }
-
-    int channels = input->shape[3];
-    if (channels <= 0) {
-        s_status = PRONE_INFERENCE_STATUS_FAULT;
-        ESP_LOGE(TAG, "モデル入力チャネル数が不正です");
-        return ESP_FAIL;
-    }
-
-    std::vector<float> mean(channels, 0.0f);
-    std::vector<float> std(channels, 255.0f);
-    s_preprocessor = new dl::image::ImagePreprocessor(s_model, mean, std, 0, s_input_name);
-    if (s_preprocessor == nullptr) {
-        s_status = PRONE_INFERENCE_STATUS_FAULT;
-        return ESP_ERR_NO_MEM;
-    }
-
-    dl::TensorBase *output = get_first_output(s_model, &s_output_name);
-    if (output == nullptr || output->get_size() <= 0) {
-        s_status = PRONE_INFERENCE_STATUS_FAULT;
-        ESP_LOGE(TAG, "モデル出力が取得できません");
-        return ESP_FAIL;
-    }
+    // 検出率重視で初期値はデフォルト運用。必要に応じて現地ログで再調整する。
+    s_detector->set_score_thr(0.50f, 0);
+    s_detector->set_nms_thr(0.50f, 0);
+    s_detector->set_score_thr(0.50f, 1);
+    s_detector->set_nms_thr(0.50f, 1);
 
     s_status = PRONE_INFERENCE_STATUS_OK;
-    ESP_LOGI(TAG, "推論モデル読み込み完了 input=%s output=%s", s_input_name.c_str(), s_output_name.c_str());
+    ESP_LOGI(TAG, "推論モデル読み込み完了 detector=HumanFaceDetect(MSRMNP_S8_V1)");
     return ESP_OK;
 }
 
-esp_err_t prone_inference_run_jpeg(const uint8_t *jpeg_data, size_t jpeg_len, bool *is_prone, float *confidence)
+esp_err_t prone_inference_run_jpeg(const uint8_t *jpeg_data, size_t jpeg_len, bool *is_face_detected, float *confidence)
 {
-    if (jpeg_data == nullptr || jpeg_len == 0 || is_prone == nullptr || confidence == nullptr) {
+    if (jpeg_data == nullptr || jpeg_len == 0 || is_face_detected == nullptr || confidence == nullptr) {
         return ESP_ERR_INVALID_ARG;
     }
 
-    if (s_model == nullptr || s_preprocessor == nullptr) {
+    if (s_detector == nullptr) {
         return ESP_ERR_INVALID_STATE;
     }
 
@@ -171,17 +60,42 @@ esp_err_t prone_inference_run_jpeg(const uint8_t *jpeg_data, size_t jpeg_len, bo
         return ESP_FAIL;
     }
 
-    s_preprocessor->preprocess(rgb);
-    s_model->run();
+    std::list<dl::detect::result_t> &result = s_detector->run(rgb);
 
-    dl::TensorBase *output = s_model->get_output(s_output_name);
-    if (output == nullptr || output->get_size() <= 0) {
-        heap_caps_free(rgb.data);
-        s_status = PRONE_INFERENCE_STATUS_FAULT;
-        return ESP_FAIL;
+    float best = 0.0f;
+    int best_x0 = -1;
+    int best_y0 = -1;
+    int best_x1 = -1;
+    int best_y1 = -1;
+    for (const auto &r : result) {
+        if (r.score > best) {
+            best = r.score;
+            if (r.box.size() >= 4) {
+                best_x0 = r.box[0];
+                best_y0 = r.box[1];
+                best_x1 = r.box[2];
+                best_y1 = r.box[3];
+            }
+        }
     }
 
-    decode_output(output, is_prone, confidence);
+    *confidence = best;
+    *is_face_detected = (best >= 0.50f);
+
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    if (now_ms - s_last_decode_log_ms >= 1000) {
+        s_last_decode_log_ms = now_ms;
+        ESP_LOGI(TAG,
+                 "cascade decode: candidates=%d best=%.3f detected=%d box=[%d,%d,%d,%d]",
+                 (int)result.size(),
+                 (double)best,
+                 (*is_face_detected) ? 1 : 0,
+                 best_x0,
+                 best_y0,
+                 best_x1,
+                 best_y1);
+    }
+
     heap_caps_free(rgb.data);
     s_status = PRONE_INFERENCE_STATUS_OK;
     return ESP_OK;
