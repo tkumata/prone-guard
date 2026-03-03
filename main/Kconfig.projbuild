@@ -1,0 +1,33 @@
+menu "Prone Guard 設定"
+
+    config WIFI_SSID
+        string "Wi-Fi SSID"
+        default "YOUR_SSID"
+        help
+            接続先の Wi-Fi SSID を指定する。
+
+    config WIFI_PASSWORD
+        string "Wi-Fi パスワード"
+        default "YOUR_PASSWORD"
+        help
+            接続先の Wi-Fi パスワードを指定する。
+
+    config STATIC_IP_ADDR
+        string "固定 IP アドレス"
+        default "192.168.0.150"
+        help
+            デバイスに割り当てる固定 IP アドレス。
+
+    config STATIC_GW_ADDR
+        string "ゲートウェイアドレス"
+        default "192.168.0.1"
+        help
+            デフォルトゲートウェイのアドレス。
+
+    config STATIC_NETMASK_ADDR
+        string "サブネットマスク"
+        default "255.255.255.0"
+        help
+            サブネットマスク。
+
+endmenu

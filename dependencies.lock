@@ -1,4 +1,15 @@
 dependencies:
+  espressif/coco_pose:
+    component_hash: fceeb7846bc6dd1fedf53677cb4d3ef0710d82f571b59bd834770ea2907d1244
+    dependencies:
+    - name: espressif/esp-dl
+      registry_url: https://components.espressif.com
+      require: private
+      version: ~3.2.0
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 0.3.0
   espressif/dl_fft:
     component_hash: 7dadbd644c0d7ba4733cc3726ec4cff6edf27b043725e1115861dec1609a3d28
     dependencies:
@@ -85,26 +96,15 @@ dependencies:
     - esp32c5
     - esp32c6
     version: 0.6.1
-  espressif/human_face_detect:
-    component_hash: db0eb640104c69b7b07b6629ab80b270fc446fee32909832d2ac7691b4e66a3e
-    dependencies:
-    - name: espressif/esp-dl
-      registry_url: https://components.espressif.com
-      require: private
-      version: ~3.2.0
-    source:
-      registry_url: https://components.espressif.com/
-      type: service
-    version: 0.3.0
   idf:
     source:
       type: idf
     version: 5.5.3
 direct_dependencies:
+- espressif/coco_pose
 - espressif/esp-dl
 - espressif/esp32-camera
-- espressif/human_face_detect
 - idf
-manifest_hash: c4b3c9b83eebf40e21d2f42fc086454d018a02a5c52c56bdd74a732e5d617012
+manifest_hash: 98b506009a023d0fb05227471e8c889cbf263486a0b220a4b067f87415fb15d0
 target: esp32s3
 version: 2.0.0

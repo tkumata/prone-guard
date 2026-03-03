@@ -12,39 +12,62 @@
 #include "esp_camera.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "nvs_flash.h"
-#include "prone_inference_bridge.h"
+#include "pose_inference_bridge.h"
+#include "prone_detector.h"
 
-#define WIFI_SSID "Rakuten-EBBB"
-#define WIFI_PASSWORD "8X62VENBT2"
+// Wi-Fi 設定 (sdkconfig / menuconfig で設定)
+#define WIFI_SSID     CONFIG_WIFI_SSID
+#define WIFI_PASSWORD CONFIG_WIFI_PASSWORD
 
+// ネットワーク設定 (sdkconfig / menuconfig で設定)
+#define STATIC_IP_ADDR    CONFIG_STATIC_IP_ADDR
+#define STATIC_GW_ADDR    CONFIG_STATIC_GW_ADDR
+#define STATIC_NETMASK    CONFIG_STATIC_NETMASK_ADDR
+
+// システム定数
 #define WIFI_RETRY_INTERVAL_MS 5000
-#define WIFI_CONNECTED_BIT BIT0
-#define FRAME_INTERVAL_MS 500
-#define FACE_CONFIDENCE_TH 0.50f
-#define FACE_DETECT_HOLD_MS (1500)
-#define FACE_MISS_FAULT_MS (3 * 1000)
+#define WIFI_CONNECTED_BIT     BIT0
 
-// Freenove ESP32-S3 WROOM CAM (OV2640) 想定ピン定義
-#define CAM_PIN_PWDN -1
+// 推論タスク設定
+#define INFERENCE_TASK_STACK_SIZE  (16 * 1024)
+#define INFERENCE_TASK_PRIORITY    5
+#define INFERENCE_TASK_CORE        1
+
+// Freenove ESP32-S3 WROOM CAM (OV2640) ピン定義
+#define CAM_PIN_PWDN  -1
 #define CAM_PIN_RESET -1
-#define CAM_PIN_XCLK 15
-#define CAM_PIN_SIOD 4
-#define CAM_PIN_SIOC 5
-#define CAM_PIN_D7 16
-#define CAM_PIN_D6 17
-#define CAM_PIN_D5 18
-#define CAM_PIN_D4 12
-#define CAM_PIN_D3 10
-#define CAM_PIN_D2 8
-#define CAM_PIN_D1 9
-#define CAM_PIN_D0 11
+#define CAM_PIN_XCLK  15
+#define CAM_PIN_SIOD  4
+#define CAM_PIN_SIOC  5
+#define CAM_PIN_D7    16
+#define CAM_PIN_D6    17
+#define CAM_PIN_D5    18
+#define CAM_PIN_D4    12
+#define CAM_PIN_D3    10
+#define CAM_PIN_D2    8
+#define CAM_PIN_D1    9
+#define CAM_PIN_D0    11
 #define CAM_PIN_VSYNC 6
-#define CAM_PIN_HREF 7
-#define CAM_PIN_PCLK 13
+#define CAM_PIN_HREF  7
+#define CAM_PIN_PCLK  13
+
+// カメラ解像度
+#define IMAGE_WIDTH   320
+#define IMAGE_HEIGHT  240
 
 static const char *TAG = "prone_guard";
 
+// キーポイント名テーブル
+static const char *kp_names[17] = {
+    "nose", "left_eye", "right_eye", "left_ear", "right_ear",
+    "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+    "left_wrist", "right_wrist", "left_hip", "right_hip",
+    "left_knee", "right_knee", "left_ankle", "right_ankle"
+};
+
+// システム状態
 typedef enum {
     SYSTEM_STATE_BOOT = 0,
     SYSTEM_STATE_WIFI_CONNECTING,
@@ -55,86 +78,58 @@ typedef enum {
     SYSTEM_STATE_FAULT_INFERENCE,
 } system_state_t;
 
-typedef enum {
-    INFERENCE_STATUS_NOT_READY = 0,
-    INFERENCE_STATUS_OK,
-    INFERENCE_STATUS_MODEL_MISSING,
-    INFERENCE_STATUS_FAULT,
-} inference_status_t;
-
+// グローバル変数
 static EventGroupHandle_t s_wifi_event_group;
 static httpd_handle_t s_http_server;
-static httpd_handle_t s_stream_http_server;
 static system_state_t s_system_state = SYSTEM_STATE_BOOT;
 static bool s_wifi_connected;
 static int64_t s_last_wifi_retry_ms;
 static esp_timer_handle_t s_wifi_retry_timer;
 static bool s_camera_ready;
-static inference_status_t s_inference_status = INFERENCE_STATUS_NOT_READY;
-static bool s_is_face_detected;
-static float s_face_confidence;
-static int64_t s_face_missing_started_ms = -1;
-static int64_t s_last_face_seen_ms = -1;
-static float s_last_face_confidence;
-static int64_t s_last_inference_ms;
-static int64_t s_last_face_log_ms;
-static prone_face_box_t s_last_face_box;
+static pose_inference_status_t s_inference_status = POSE_INFERENCE_STATUS_NOT_READY;
 
-static esp_err_t run_prone_inference(camera_fb_t *fb, bool *is_face_detected, float *confidence);
-static void update_face_monitor(bool is_face_detected, float confidence);
-static esp_err_t face_box_get_handler(httpd_req_t *req);
+// 最新の推論・判定結果 (推論タスクが書き込み、httpd が読み取り)
+static SemaphoreHandle_t s_result_mutex;
+static pose_result_t s_last_pose;
+static prone_result_t s_last_prone;
+static int64_t s_person_missing_started_ms = -1;
+
+
+
+// ---- 状態管理 ----
 
 static const char *state_to_string(system_state_t state)
 {
     switch (state) {
-    case SYSTEM_STATE_BOOT:
-        return "BOOT";
-    case SYSTEM_STATE_WIFI_CONNECTING:
-        return "WIFI_CONNECTING";
-    case SYSTEM_STATE_READY:
-        return "READY";
-    case SYSTEM_STATE_MONITORING:
-        return "MONITORING";
-    case SYSTEM_STATE_ALERT:
-        return "ALERT";
-    case SYSTEM_STATE_FAULT_CAMERA:
-        return "FAULT_CAMERA";
-    case SYSTEM_STATE_FAULT_INFERENCE:
-        return "FAULT_INFERENCE";
-    default:
-        return "UNKNOWN";
+    case SYSTEM_STATE_BOOT:             return "BOOT";
+    case SYSTEM_STATE_WIFI_CONNECTING:  return "WIFI_CONNECTING";
+    case SYSTEM_STATE_READY:            return "READY";
+    case SYSTEM_STATE_MONITORING:       return "MONITORING";
+    case SYSTEM_STATE_ALERT:            return "ALERT";
+    case SYSTEM_STATE_FAULT_CAMERA:     return "FAULT_CAMERA";
+    case SYSTEM_STATE_FAULT_INFERENCE:  return "FAULT_INFERENCE";
+    default:                            return "UNKNOWN";
     }
 }
 
-static const char *inference_status_to_string(inference_status_t status)
+static const char *inference_status_to_string(pose_inference_status_t status)
 {
     switch (status) {
-    case INFERENCE_STATUS_NOT_READY:
-        return "not_ready";
-    case INFERENCE_STATUS_OK:
-        return "ok";
-    case INFERENCE_STATUS_MODEL_MISSING:
-        return "model_missing";
-    case INFERENCE_STATUS_FAULT:
-        return "fault";
-    default:
-        return "unknown";
+    case POSE_INFERENCE_STATUS_NOT_READY:    return "not_ready";
+    case POSE_INFERENCE_STATUS_OK:           return "ok";
+    case POSE_INFERENCE_STATUS_MODEL_MISSING: return "model_missing";
+    case POSE_INFERENCE_STATUS_FAULT:        return "fault";
+    default:                                 return "unknown";
     }
 }
 
-static inference_status_t from_bridge_status(prone_inference_status_t status)
+static const char *prone_status_to_string(prone_status_t status)
 {
     switch (status) {
-    case PRONE_INFERENCE_STATUS_NOT_READY:
-        return INFERENCE_STATUS_NOT_READY;
-    case PRONE_INFERENCE_STATUS_OK:
-        return INFERENCE_STATUS_OK;
-    case PRONE_INFERENCE_STATUS_MODEL_MISSING:
-        return INFERENCE_STATUS_MODEL_MISSING;
-    case PRONE_INFERENCE_STATUS_FAULT:
-        return INFERENCE_STATUS_FAULT;
-    default:
-        return INFERENCE_STATUS_FAULT;
+    case PRONE_STATUS_UNKNOWN:    return "unknown";
+    case PRONE_STATUS_NOT_PRONE:  return "not_prone";
+    case PRONE_STATUS_PRONE:      return "prone";
+    default:                      return "unknown";
     }
 }
 
@@ -143,48 +138,200 @@ static void set_system_state(system_state_t next_state)
     if (s_system_state == next_state) {
         return;
     }
-
     ESP_LOGI(TAG, "状態遷移: %s -> %s", state_to_string(s_system_state), state_to_string(next_state));
     s_system_state = next_state;
 }
+
+// ---- 推論タスク (専用スレッド) ----
+
+static void inference_task(void *arg)
+{
+    (void)arg;
+    ESP_LOGI(TAG, "推論タスク開始 (CPU %d)", xPortGetCoreID());
+
+    while (true) {
+        if (!s_camera_ready) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        // カメラフレーム取得
+        camera_fb_t *fb = esp_camera_fb_get();
+        if (fb == NULL) {
+            ESP_LOGW(TAG, "カメラフレーム取得失敗");
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
+
+
+        // 推論実行
+        pose_result_t pose = {0};
+        esp_err_t err = pose_inference_run_jpeg(fb->buf, fb->len, &pose);
+
+        // フレームバッファを即座に返却 (推論結果はコピー済み)
+        esp_camera_fb_return(fb);
+
+        // WDT 対策: 推論後に明示的に譲る
+        vTaskDelay(pdMS_TO_TICKS(10));
+
+        if (err != ESP_OK) {
+            s_inference_status = POSE_INFERENCE_STATUS_FAULT;
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        s_inference_status = POSE_INFERENCE_STATUS_OK;
+        int64_t now_ms = esp_timer_get_time() / 1000;
+
+        // 結果を排他的に更新
+        if (xSemaphoreTake(s_result_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            s_last_pose = pose;
+
+            if (pose.detected) {
+                s_person_missing_started_ms = -1;
+
+                // うつ伏せ判定
+                prone_result_t prone = prone_check(pose.keypoints, pose.bbox, IMAGE_WIDTH, IMAGE_HEIGHT);
+                s_last_prone = prone;
+
+                // 状態遷移
+                if (prone.status == PRONE_STATUS_PRONE) {
+                    if (s_system_state == SYSTEM_STATE_MONITORING) {
+                        set_system_state(SYSTEM_STATE_ALERT);
+                    }
+                } else if (prone.status == PRONE_STATUS_NOT_PRONE) {
+                    if (s_system_state == SYSTEM_STATE_ALERT) {
+                        set_system_state(SYSTEM_STATE_MONITORING);
+                    }
+                }
+
+                // FAULT_INFERENCE からの復帰
+                if (s_system_state == SYSTEM_STATE_FAULT_INFERENCE && s_camera_ready) {
+                    set_system_state(SYSTEM_STATE_MONITORING);
+                }
+            } else {
+                // 人物未検出
+                s_last_prone.status = PRONE_STATUS_UNKNOWN;
+                s_last_prone.score = 0.0f;
+                s_last_prone.held_ms = 0;
+
+                if (s_person_missing_started_ms < 0) {
+                    s_person_missing_started_ms = now_ms;
+                }
+                if ((now_ms - s_person_missing_started_ms) >= PERSON_MISSING_FAULT_MS) {
+                    if (s_system_state != SYSTEM_STATE_FAULT_CAMERA) {
+                        set_system_state(SYSTEM_STATE_FAULT_INFERENCE);
+                    }
+                }
+            }
+
+            xSemaphoreGive(s_result_mutex);
+        }
+
+        // 定期ログ (推論結果)
+        static int64_t s_last_log_ms = 0;
+        if (now_ms - s_last_log_ms >= 2000) {
+            s_last_log_ms = now_ms;
+            ESP_LOGI(TAG,
+                     "inference: detected=%d score=%.2f prone=%.2f status=%s state=%s",
+                     pose.detected ? 1 : 0,
+                     (double)pose.score,
+                     (double)s_last_prone.score,
+                     prone_status_to_string(s_last_prone.status),
+                     state_to_string(s_system_state));
+        }
+
+        // 次のフレームまで少し待機 (TWDT 対策)
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+// ---- HTTP ハンドラ ----
 
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
     static const char html[] =
         "<!doctype html>"
-        "<html><head><meta charset=\"utf-8\"><title>顔認識監視</title>"
+        "<html><head><meta charset=\"utf-8\"><title>うつ伏せ検知</title>"
         "<style>"
-        "#wrap{position:relative;width:320px;height:240px;display:inline-block;}"
-        "#stream{width:320px;height:240px;display:block;}"
-        "#face-box{position:absolute;border:2px solid red;display:none;pointer-events:none;box-sizing:border-box;}"
+        "body{background:#1a1a2e;color:#eee;font-family:'Segoe UI',system-ui,sans-serif;margin:0;padding:20px;}"
+        "h1{color:#e94560;margin-bottom:10px;}"
+        "#wrap{position:relative;width:320px;height:240px;display:inline-block;border:2px solid #0f3460;border-radius:8px;overflow:hidden;background:#000;}"
+        "#snap{width:320px;height:240px;display:block;}"
+        "canvas{position:absolute;top:0;left:0;pointer-events:none;}"
+        "#status{margin-top:12px;padding:10px;background:#16213e;border-radius:8px;font-size:14px;max-width:320px;}"
+        "#status.alert{border:2px solid #e94560;animation:pulse 1s infinite;}"
+        "@keyframes pulse{0%,100%{opacity:1;}50%{opacity:0.6;}}"
+        ".badge{display:inline-block;padding:2px 8px;border-radius:4px;font-weight:bold;}"
+        ".badge-ok{background:#0a8754;}.badge-alert{background:#e94560;}.badge-warn{background:#f0a500;}"
+        "a{color:#4ea8de;}"
         "</style>"
         "</head>"
         "<body>"
-        "<h1>顔認識監視</h1>"
+        "<h1>うつ伏せ検知モニター</h1>"
         "<div id=\"wrap\">"
-        "<img src=\"http://\" onerror=\"this.outerHTML='<p>stream 読み込み失敗</p>'\" id=\"stream\" alt=\"stream\" width=\"320\" height=\"240\">"
-        "<div id=\"face-box\"></div>"
+        "<img id=\"snap\" alt=\"snapshot\" width=\"320\" height=\"240\">"
+        "<canvas id=\"cv\" width=\"320\" height=\"240\"></canvas>"
         "</div>"
-        "<p>状態確認: <a href=\"/health\">/health</a></p>"
-        "<p>枠座標: <a href=\"/face_box\">/face_box</a></p>"
+        "<div id=\"status\">読み込み中...</div>"
+        "<p><a href=\"/health\">/health</a> | <a href=\"/keypoints\">/keypoints</a></p>"
         "<script>"
-        "const img=document.getElementById('stream');"
-        "const box=document.getElementById('face-box');"
-        "img.src='http://'+location.hostname+':81/stream';"
-        "const clamp=(v,min,max)=>Math.min(max,Math.max(min,v));"
-        "setInterval(async()=>{"
+        "const img=document.getElementById('snap');"
+        "const cv=document.getElementById('cv');"
+        "const ctx=cv.getContext('2d');"
+        "const st=document.getElementById('status');"
+        /* キーポイントの描画色 */
+        "const colors=['#e94560','#f0a500','#f0a500','#4ea8de','#4ea8de',"
+        "'#0a8754','#0a8754','#2ec4b6','#2ec4b6','#e9c46a','#e9c46a',"
+        "'#e76f51','#e76f51','#264653','#264653','#6a0572','#6a0572'];"
+        /* スケルトン接続定義 */
+        "const skel=[[0,1],[0,2],[1,3],[2,4],[5,6],[5,7],[7,9],[6,8],[8,10],[5,11],[6,12],[11,12],[11,13],[13,15],[12,14],[14,16]];"
+        /* 定期更新: スナップショット + キーポイント */
+        "async function update(){"
         "try{"
-        "const r=await fetch('/face_box',{cache:'no-store'});"
-        "if(!r.ok){box.style.display='none';return;}"
+        /* スナップショット更新 (キャッシュ回避) */
+        "img.src='/snapshot?t='+Date.now();"
+        /* キーポイント取得 */
+        "const r=await fetch('/keypoints',{cache:'no-store'});"
+        "if(!r.ok)return;"
         "const d=await r.json();"
-        "if(!d.detected){box.style.display='none';return;}"
-        "const x0=clamp(d.x0,0,319),y0=clamp(d.y0,0,239),x1=clamp(d.x1,0,319),y1=clamp(d.y1,0,239);"
-        "if(x1<=x0||y1<=y0){box.style.display='none';return;}"
-        "box.style.left=x0+'px';box.style.top=y0+'px';"
-        "box.style.width=(x1-x0)+'px';box.style.height=(y1-y0)+'px';"
-        "box.style.display='block';"
-        "}catch(e){box.style.display='none';}"
-        "},200);"
+        "ctx.clearRect(0,0,320,240);"
+        "if(!d.detected){st.textContent='人物未検出';st.className='';return;}"
+        /* バウンディングボックス描画 */
+        "ctx.strokeStyle=d.prone.status==='prone'?'#e94560':'#0a8754';"
+        "ctx.lineWidth=2;"
+        "const b=d.bbox;"
+        "ctx.strokeRect(b[0],b[1],b[2]-b[0],b[3]-b[1]);"
+        /* スケルトン描画 */
+        "const kp=d.keypoints;"
+        "ctx.lineWidth=1.5;ctx.strokeStyle='rgba(255,255,255,0.5)';"
+        "for(const[i,j]of skel){"
+        "const a=kp[i],bb=kp[j];"
+        "if((a.x||a.y)&&(bb.x||bb.y)){"
+        "ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(bb.x,bb.y);ctx.stroke();"
+        "}}"
+        /* キーポイント描画 */
+        "for(let i=0;i<kp.length;i++){"
+        "const p=kp[i];"
+        "if(!p.x&&!p.y)continue;"
+        "ctx.fillStyle=colors[i]||'#fff';"
+        "ctx.beginPath();ctx.arc(p.x,p.y,3,0,Math.PI*2);ctx.fill();"
+        "}"
+        /* ステータス表示 */
+        "let badge='';"
+        "if(d.prone.status==='prone'){"
+        "badge='<span class=\"badge badge-alert\">ALERT</span>';"
+        "st.className='status alert';"
+        "}else{"
+        "badge='<span class=\"badge badge-ok\">OK</span>';"
+        "st.className='status';"
+        "}"
+        "st.innerHTML=badge+' スコア: '+d.prone.score.toFixed(2)+' | ホールド: '+d.prone.held_ms+'ms | 信頼度: '+d.score.toFixed(2);"
+        "}catch(e){}"
+        "}"
+        "setInterval(update,3000);"
+        "update();"
         "</script>"
         "</body></html>";
 
@@ -192,205 +339,111 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
 }
 
-static esp_err_t health_get_handler(httpd_req_t *req)
-{
-    char json[256];
-    const char *wifi_status = s_wifi_connected ? "connected" : "disconnected";
-    const char *camera_status = s_camera_ready ? "ok" : "fault";
-    const char *inference_status = inference_status_to_string(s_inference_status);
-
-    int written = snprintf(json,
-                           sizeof(json),
-                           "{\"state\":\"%s\",\"wifi\":\"%s\",\"camera\":\"%s\",\"inference\":\"%s\","
-                           "\"face_detected\":%s,\"face_confidence\":%.3f}",
-                           state_to_string(s_system_state),
-                           wifi_status,
-                           camera_status,
-                           inference_status,
-                           s_is_face_detected ? "true" : "false",
-                           (double)s_face_confidence);
-    if (written < 0 || written >= (int)sizeof(json)) {
-        return ESP_FAIL;
-    }
-
-    httpd_resp_set_type(req, "application/json");
-    return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
-}
-
-static esp_err_t face_box_get_handler(httpd_req_t *req)
-{
-    char json[192];
-    prone_face_box_t box = s_last_face_box;
-    bool detected = s_is_face_detected && box.valid;
-    if (detected) {
-        if (box.x0 < 0) {
-            box.x0 = 0;
-        }
-        if (box.y0 < 0) {
-            box.y0 = 0;
-        }
-        if (box.x1 > 319) {
-            box.x1 = 319;
-        }
-        if (box.y1 > 239) {
-            box.y1 = 239;
-        }
-        if (box.x1 <= box.x0 || box.y1 <= box.y0) {
-            detected = false;
-        }
-    }
-
-    int written = snprintf(json,
-                           sizeof(json),
-                           "{\"detected\":%s,\"x0\":%d,\"y0\":%d,\"x1\":%d,\"y1\":%d,\"confidence\":%.3f}",
-                           detected ? "true" : "false",
-                           detected ? box.x0 : -1,
-                           detected ? box.y0 : -1,
-                           detected ? box.x1 : -1,
-                           detected ? box.y1 : -1,
-                           (double)(detected ? box.confidence : 0.0f));
-    if (written < 0 || written >= (int)sizeof(json)) {
-        return ESP_FAIL;
-    }
-
-    httpd_resp_set_type(req, "application/json");
-    return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
-}
-
-static esp_err_t stream_get_handler(httpd_req_t *req)
+static esp_err_t snapshot_get_handler(httpd_req_t *req)
 {
     if (!s_camera_ready) {
-        static const char message[] = "camera not ready";
         httpd_resp_set_status(req, "503 Service Unavailable");
         httpd_resp_set_type(req, "text/plain");
-        return httpd_resp_send(req, message, HTTPD_RESP_USE_STRLEN);
+        return httpd_resp_send(req, "camera not ready", HTTPD_RESP_USE_STRLEN);
     }
 
-    static const char *stream_content_type = "multipart/x-mixed-replace;boundary=frame";
-    static const char *stream_boundary = "\r\n--frame\r\n";
-    char part_header[64];
-
-    httpd_resp_set_type(req, stream_content_type);
-    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
-    httpd_resp_set_hdr(req, "Connection", "close");
-
-    while (true) {
-        camera_fb_t *fb = esp_camera_fb_get();
-        if (fb == NULL) {
-            ESP_LOGW(TAG, "カメラフレーム取得失敗");
-            continue;
-        }
-
-        int64_t now_ms = esp_timer_get_time() / 1000;
-        if (now_ms - s_last_inference_ms >= FRAME_INTERVAL_MS) {
-            s_last_inference_ms = now_ms;
-            esp_err_t infer_err = run_prone_inference(fb, &s_is_face_detected, &s_face_confidence);
-            if (infer_err == ESP_OK) {
-                s_inference_status = INFERENCE_STATUS_OK;
-            } else if (infer_err != ESP_ERR_NOT_FOUND) {
-                s_inference_status = INFERENCE_STATUS_FAULT;
-            }
-            update_face_monitor(s_is_face_detected, s_face_confidence);
-        }
-
-        int hlen = snprintf(part_header,
-                            sizeof(part_header),
-                            "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
-                            (unsigned)fb->len);
-        if (hlen <= 0 || hlen >= (int)sizeof(part_header)) {
-            esp_camera_fb_return(fb);
-            return ESP_FAIL;
-        }
-
-        esp_err_t err = httpd_resp_send_chunk(req, stream_boundary, strlen(stream_boundary));
-        if (err == ESP_OK) {
-            err = httpd_resp_send_chunk(req, part_header, hlen);
-        }
-        if (err == ESP_OK) {
-            err = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
-        }
-        if (err == ESP_OK) {
-            err = httpd_resp_send_chunk(req, "\r\n", 2);
-        }
-
-        esp_camera_fb_return(fb);
-        if (err != ESP_OK) {
-            break;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(30));
+    // リクエスト時にカメラから直接フレームを取得 (推論とは独立)
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (fb == NULL) {
+        httpd_resp_set_status(req, "503 Service Unavailable");
+        httpd_resp_set_type(req, "text/plain");
+        return httpd_resp_send(req, "no frame", HTTPD_RESP_USE_STRLEN);
     }
 
-    return ESP_OK;
-}
-
-static esp_err_t run_prone_inference(camera_fb_t *fb, bool *is_face_detected, float *confidence)
-{
-    if (fb == NULL || is_face_detected == NULL || confidence == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    esp_err_t err = prone_inference_run_jpeg(fb->buf, fb->len, is_face_detected, confidence);
-    if (err == ESP_OK) {
-        prone_inference_get_last_face_box(&s_last_face_box);
-    } else {
-        s_last_face_box.valid = false;
-    }
-    s_inference_status = from_bridge_status(prone_inference_get_status());
+    httpd_resp_set_type(req, "image/jpeg");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+    esp_err_t err = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+    esp_camera_fb_return(fb);
     return err;
 }
 
-static void update_face_monitor(bool is_face_detected, float confidence)
+static esp_err_t health_get_handler(httpd_req_t *req)
 {
-    int64_t now_ms = esp_timer_get_time() / 1000;
-    bool raw_face_ok = is_face_detected && (confidence >= FACE_CONFIDENCE_TH);
+    char json[256];
 
-    if (raw_face_ok) {
-        s_last_face_seen_ms = now_ms;
-        s_last_face_confidence = confidence;
+    bool prone_detected = false;
+    float prone_score = 0.0f;
+
+    if (xSemaphoreTake(s_result_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        prone_detected = (s_last_prone.status == PRONE_STATUS_PRONE);
+        prone_score = s_last_prone.score;
+        xSemaphoreGive(s_result_mutex);
     }
 
-    bool face_ok = raw_face_ok;
-    if (!face_ok && s_last_face_seen_ms >= 0 && (now_ms - s_last_face_seen_ms) <= FACE_DETECT_HOLD_MS) {
-        face_ok = true;
-        is_face_detected = true;
-        confidence = s_last_face_confidence;
+    int written = snprintf(json, sizeof(json),
+        "{\"state\":\"%s\",\"wifi\":\"%s\",\"camera\":\"%s\",\"inference\":\"%s\","
+        "\"prone_detected\":%s,\"prone_score\":%.3f}",
+        state_to_string(s_system_state),
+        s_wifi_connected ? "connected" : "disconnected",
+        s_camera_ready ? "ok" : "fault",
+        inference_status_to_string(s_inference_status),
+        prone_detected ? "true" : "false",
+        (double)prone_score);
+
+    if (written < 0 || written >= (int)sizeof(json)) {
+        return ESP_FAIL;
     }
 
-    s_is_face_detected = face_ok;
-    s_face_confidence = face_ok ? confidence : 0.0f;
-
-    if (now_ms - s_last_face_log_ms >= 1000) {
-        s_last_face_log_ms = now_ms;
-        ESP_LOGI(TAG,
-                 "face monitor: detected=%d confidence=%.3f raw_ok=%d hold_ms=%d threshold=%.2f state=%s",
-                 s_is_face_detected ? 1 : 0,
-                 (double)s_face_confidence,
-                 raw_face_ok ? 1 : 0,
-                 (int)FACE_DETECT_HOLD_MS,
-                 (double)FACE_CONFIDENCE_TH,
-                 state_to_string(s_system_state));
-    }
-
-    if (face_ok) {
-        s_face_missing_started_ms = -1;
-        if (s_system_state == SYSTEM_STATE_FAULT_INFERENCE && s_camera_ready) {
-            set_system_state(SYSTEM_STATE_MONITORING);
-        }
-        return;
-    }
-
-    if (s_face_missing_started_ms < 0) {
-        s_face_missing_started_ms = now_ms;
-    }
-
-    if ((now_ms - s_face_missing_started_ms) >= FACE_MISS_FAULT_MS) {
-        s_inference_status = INFERENCE_STATUS_FAULT;
-        if (s_system_state != SYSTEM_STATE_FAULT_CAMERA) {
-            set_system_state(SYSTEM_STATE_FAULT_INFERENCE);
-        }
-    }
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
 }
+
+static esp_err_t keypoints_get_handler(httpd_req_t *req)
+{
+    char json[1500];
+    int offset = 0;
+
+    pose_result_t pose = {0};
+    prone_result_t prone = {0};
+
+    if (xSemaphoreTake(s_result_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        pose = s_last_pose;
+        prone = s_last_prone;
+        xSemaphoreGive(s_result_mutex);
+    }
+
+    offset += snprintf(json + offset, sizeof(json) - offset,
+        "{\"detected\":%s,\"score\":%.3f,\"bbox\":[%d,%d,%d,%d],\"keypoints\":[",
+        pose.detected ? "true" : "false",
+        (double)pose.score,
+        pose.bbox[0], pose.bbox[1],
+        pose.bbox[2], pose.bbox[3]);
+
+    for (int i = 0; i < 17; i++) {
+        if (i > 0) {
+            offset += snprintf(json + offset, sizeof(json) - offset, ",");
+        }
+        offset += snprintf(json + offset, sizeof(json) - offset,
+            "{\"name\":\"%s\",\"x\":%d,\"y\":%d}",
+            kp_names[i],
+            pose.keypoints[2 * i],
+            pose.keypoints[2 * i + 1]);
+
+        if (offset >= (int)sizeof(json) - 1) {
+            return ESP_FAIL;
+        }
+    }
+
+    offset += snprintf(json + offset, sizeof(json) - offset,
+        "],\"prone\":{\"status\":\"%s\",\"score\":%.3f,\"held_ms\":%lld}}",
+        prone_status_to_string(prone.status),
+        (double)prone.score,
+        (long long)prone.held_ms);
+
+    if (offset < 0 || offset >= (int)sizeof(json)) {
+        return ESP_FAIL;
+    }
+
+    httpd_resp_set_type(req, "application/json");
+    return httpd_resp_send(req, json, offset);
+}
+
+// ---- HTTP サーバ (ポート 80 のみ) ----
 
 static esp_err_t start_http_server(void)
 {
@@ -400,10 +453,11 @@ static esp_err_t start_http_server(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
+    config.max_open_sockets = 4;
 
     esp_err_t err = httpd_start(&s_http_server, &config);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "HTTP サーバ開始失敗: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "HTTP サーバ起動失敗: %s", esp_err_to_name(err));
         return err;
     }
 
@@ -413,55 +467,35 @@ static esp_err_t start_http_server(void)
         .handler = root_get_handler,
         .user_ctx = NULL,
     };
-
+    const httpd_uri_t snapshot_uri = {
+        .uri = "/snapshot",
+        .method = HTTP_GET,
+        .handler = snapshot_get_handler,
+        .user_ctx = NULL,
+    };
     const httpd_uri_t health_uri = {
         .uri = "/health",
         .method = HTTP_GET,
         .handler = health_get_handler,
         .user_ctx = NULL,
     };
-    const httpd_uri_t face_box_uri = {
-        .uri = "/face_box",
+    const httpd_uri_t keypoints_uri = {
+        .uri = "/keypoints",
         .method = HTTP_GET,
-        .handler = face_box_get_handler,
+        .handler = keypoints_get_handler,
         .user_ctx = NULL,
     };
 
     httpd_register_uri_handler(s_http_server, &root_uri);
+    httpd_register_uri_handler(s_http_server, &snapshot_uri);
     httpd_register_uri_handler(s_http_server, &health_uri);
-    httpd_register_uri_handler(s_http_server, &face_box_uri);
+    httpd_register_uri_handler(s_http_server, &keypoints_uri);
 
-    ESP_LOGI(TAG, "HTTP サーバ開始");
+    ESP_LOGI(TAG, "HTTP サーバ起動 (port 80)");
     return ESP_OK;
 }
 
-static esp_err_t start_stream_http_server(void)
-{
-    if (s_stream_http_server != NULL) {
-        return ESP_OK;
-    }
-
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.server_port = 81;
-    config.ctrl_port = 32769;
-    config.lru_purge_enable = true;
-
-    esp_err_t err = httpd_start(&s_stream_http_server, &config);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "ストリームサーバ開始失敗: %s", esp_err_to_name(err));
-        return err;
-    }
-
-    const httpd_uri_t stream_uri = {
-        .uri = "/stream",
-        .method = HTTP_GET,
-        .handler = stream_get_handler,
-        .user_ctx = NULL,
-    };
-    httpd_register_uri_handler(s_stream_http_server, &stream_uri);
-    ESP_LOGI(TAG, "ストリームサーバ開始 port=81");
-    return ESP_OK;
-}
+// ---- Wi-Fi ----
 
 static void wifi_retry_timer_cb(void *arg)
 {
@@ -469,7 +503,6 @@ static void wifi_retry_timer_cb(void *arg)
     if (s_wifi_connected) {
         return;
     }
-
     s_last_wifi_retry_ms = esp_timer_get_time() / 1000;
     ESP_LOGW(TAG, "Wi-Fi 再接続試行");
     esp_wifi_connect();
@@ -538,7 +571,16 @@ static esp_err_t start_wifi_sta(void)
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_sta();
+    esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
+
+    // 固定 IP 設定
+    ESP_ERROR_CHECK(esp_netif_dhcpc_stop(sta_netif));
+    esp_netif_ip_info_t ip_info = {0};
+    esp_netif_str_to_ip4(STATIC_IP_ADDR, &ip_info.ip);
+    esp_netif_str_to_ip4(STATIC_GW_ADDR, &ip_info.gw);
+    esp_netif_str_to_ip4(STATIC_NETMASK, &ip_info.netmask);
+    ESP_ERROR_CHECK(esp_netif_set_ip_info(sta_netif, &ip_info));
+    ESP_LOGI(TAG, "固定 IP 設定: %s", STATIC_IP_ADDR);
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -562,7 +604,6 @@ static esp_err_t start_wifi_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     s_last_wifi_retry_ms = 0;
-    s_last_inference_ms = 0;
 
     const esp_timer_create_args_t timer_args = {
         .callback = wifi_retry_timer_cb,
@@ -574,6 +615,8 @@ static esp_err_t start_wifi_sta(void)
 
     return ESP_OK;
 }
+
+// ---- カメラ ----
 
 static esp_err_t init_camera(void)
 {
@@ -614,18 +657,20 @@ static esp_err_t init_camera(void)
     }
 
     s_camera_ready = true;
-    ESP_LOGI(TAG, "カメラ初期化完了");
+    ESP_LOGI(TAG, "カメラ初期化完了 (QVGA 320x240)");
     return ESP_OK;
 }
+
+// ---- メインエントリ ----
 
 void app_main(void)
 {
     ESP_ERROR_CHECK(init_nvs());
     set_system_state(SYSTEM_STATE_BOOT);
 
-    if (strcmp(WIFI_SSID, "YOUR_SSID") == 0 || strcmp(WIFI_PASSWORD, "YOUR_PASSWORD") == 0) {
-        ESP_LOGW(TAG, "WIFI_SSID / WIFI_PASSWORD を実環境の値に変更してください");
-    }
+    // ミューテックス初期化
+    s_result_mutex = xSemaphoreCreateMutex();
+    assert(s_result_mutex != NULL);
 
     ESP_ERROR_CHECK(start_wifi_sta());
 
@@ -637,22 +682,33 @@ void app_main(void)
     if ((bits & WIFI_CONNECTED_BIT) != 0) {
         esp_err_t cam_err = init_camera();
         if (cam_err != ESP_OK) {
-            ESP_LOGW(TAG, "カメラが未準備のため /stream は 503 を返します");
+            ESP_LOGW(TAG, "カメラ未準備");
         }
 
-        esp_err_t infer_init_err = prone_inference_init();
-        if (infer_init_err != ESP_OK) {
-            s_inference_status = from_bridge_status(prone_inference_get_status());
-            ESP_LOGW(TAG, "推論初期化未完了: %s", esp_err_to_name(infer_init_err));
+        esp_err_t infer_err = pose_inference_init();
+        if (infer_err != ESP_OK) {
+            s_inference_status = pose_inference_get_status();
+            ESP_LOGW(TAG, "推論初期化未完了: %s", esp_err_to_name(infer_err));
         } else {
-            s_inference_status = INFERENCE_STATUS_OK;
+            s_inference_status = POSE_INFERENCE_STATUS_OK;
         }
 
         ESP_ERROR_CHECK(start_http_server());
-        ESP_ERROR_CHECK(start_stream_http_server());
+
         if (s_camera_ready) {
             set_system_state(SYSTEM_STATE_MONITORING);
         }
+
+        // 推論タスクを専用コアで起動
+        xTaskCreatePinnedToCore(
+            inference_task,
+            "inference",
+            INFERENCE_TASK_STACK_SIZE,
+            NULL,
+            INFERENCE_TASK_PRIORITY,
+            NULL,
+            INFERENCE_TASK_CORE
+        );
     }
 
     while (true) {
