@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -12,6 +13,7 @@
 #include "esp_camera.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "nvs_flash.h"
 #include "prone_inference_bridge.h"
 
@@ -20,8 +22,10 @@
 
 #define WIFI_RETRY_INTERVAL_MS 5000
 #define WIFI_CONNECTED_BIT BIT0
-#define FRAME_INTERVAL_MS 500
-#define FACE_CONFIDENCE_TH 0.50f
+#define INFERENCE_INTERVAL_MS 500
+#define STREAM_PACING_DELAY_MS 5
+#define INFERENCE_JPEG_MAX_BYTES (96 * 1024)
+#define FACE_CONFIDENCE_TH 0.45f
 #define FACE_DETECT_HOLD_MS (1500)
 #define FACE_MISS_FAULT_MS (3 * 1000)
 
@@ -79,10 +83,18 @@ static float s_last_face_confidence;
 static int64_t s_last_inference_ms;
 static int64_t s_last_face_log_ms;
 static prone_face_box_t s_last_face_box;
+static SemaphoreHandle_t s_inference_frame_mutex;
+static uint8_t *s_inference_frame_buf;
+static size_t s_inference_frame_len;
+static bool s_inference_frame_pending;
+static TaskHandle_t s_inference_task_handle;
 
 static esp_err_t run_prone_inference(camera_fb_t *fb, bool *is_face_detected, float *confidence);
 static void update_face_monitor(bool is_face_detected, float confidence);
 static esp_err_t face_box_get_handler(httpd_req_t *req);
+static bool publish_frame_for_inference(camera_fb_t *fb);
+static void inference_task(void *arg);
+static esp_err_t start_inference_task(void);
 
 static const char *state_to_string(system_state_t state)
 {
@@ -282,15 +294,10 @@ static esp_err_t stream_get_handler(httpd_req_t *req)
         }
 
         int64_t now_ms = esp_timer_get_time() / 1000;
-        if (now_ms - s_last_inference_ms >= FRAME_INTERVAL_MS) {
-            s_last_inference_ms = now_ms;
-            esp_err_t infer_err = run_prone_inference(fb, &s_is_face_detected, &s_face_confidence);
-            if (infer_err == ESP_OK) {
-                s_inference_status = INFERENCE_STATUS_OK;
-            } else if (infer_err != ESP_ERR_NOT_FOUND) {
-                s_inference_status = INFERENCE_STATUS_FAULT;
+        if ((now_ms - s_last_inference_ms) >= INFERENCE_INTERVAL_MS) {
+            if (publish_frame_for_inference(fb)) {
+                s_last_inference_ms = now_ms;
             }
-            update_face_monitor(s_is_face_detected, s_face_confidence);
         }
 
         int hlen = snprintf(part_header,
@@ -318,7 +325,7 @@ static esp_err_t stream_get_handler(httpd_req_t *req)
             break;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(30));
+        vTaskDelay(pdMS_TO_TICKS(STREAM_PACING_DELAY_MS));
     }
 
     return ESP_OK;
@@ -338,6 +345,123 @@ static esp_err_t run_prone_inference(camera_fb_t *fb, bool *is_face_detected, fl
     }
     s_inference_status = from_bridge_status(prone_inference_get_status());
     return err;
+}
+
+static bool publish_frame_for_inference(camera_fb_t *fb)
+{
+    if (fb == NULL || fb->buf == NULL || fb->len == 0) {
+        return false;
+    }
+
+    if (fb->len > INFERENCE_JPEG_MAX_BYTES) {
+        ESP_LOGW(TAG, "推論用 JPEG が大きすぎるためスキップ: %u bytes", (unsigned)fb->len);
+        return false;
+    }
+
+    if (s_inference_frame_buf == NULL || s_inference_frame_mutex == NULL) {
+        return false;
+    }
+
+    if (xSemaphoreTake(s_inference_frame_mutex, pdMS_TO_TICKS(5)) != pdTRUE) {
+        return false;
+    }
+
+    memcpy(s_inference_frame_buf, fb->buf, fb->len);
+    s_inference_frame_len = fb->len;
+    s_inference_frame_pending = true;
+    xSemaphoreGive(s_inference_frame_mutex);
+    return true;
+}
+
+static void inference_task(void *arg)
+{
+    (void)arg;
+
+    uint8_t *work_buf = (uint8_t *)heap_caps_malloc(INFERENCE_JPEG_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (work_buf == NULL) {
+        work_buf = (uint8_t *)heap_caps_malloc(INFERENCE_JPEG_MAX_BYTES, MALLOC_CAP_8BIT);
+    }
+    if (work_buf == NULL) {
+        ESP_LOGE(TAG, "推論タスク作業バッファ確保失敗");
+        s_inference_status = INFERENCE_STATUS_FAULT;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    while (true) {
+        size_t frame_len = 0;
+
+        if (xSemaphoreTake(s_inference_frame_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            if (s_inference_frame_pending && s_inference_frame_len > 0) {
+                frame_len = s_inference_frame_len;
+                memcpy(work_buf, s_inference_frame_buf, frame_len);
+                s_inference_frame_pending = false;
+            }
+            xSemaphoreGive(s_inference_frame_mutex);
+        }
+
+        if (frame_len == 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        camera_fb_t fb = {
+            .buf = work_buf,
+            .len = frame_len,
+            .width = 320,
+            .height = 240,
+            .format = PIXFORMAT_JPEG,
+        };
+        bool is_face_detected = false;
+        float confidence = 0.0f;
+        esp_err_t infer_err = run_prone_inference(&fb, &is_face_detected, &confidence);
+        if (infer_err == ESP_OK) {
+            s_inference_status = INFERENCE_STATUS_OK;
+        } else if (infer_err != ESP_ERR_NOT_FOUND) {
+            s_inference_status = INFERENCE_STATUS_FAULT;
+        }
+        update_face_monitor(is_face_detected, confidence);
+    }
+}
+
+static esp_err_t start_inference_task(void)
+{
+    if (s_inference_task_handle != NULL) {
+        return ESP_OK;
+    }
+
+    if (s_inference_frame_mutex == NULL) {
+        s_inference_frame_mutex = xSemaphoreCreateMutex();
+        if (s_inference_frame_mutex == NULL) {
+            ESP_LOGE(TAG, "推論共有ミューテックス確保失敗");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    s_inference_frame_buf = (uint8_t *)heap_caps_malloc(INFERENCE_JPEG_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_inference_frame_buf == NULL) {
+        s_inference_frame_buf = (uint8_t *)heap_caps_malloc(INFERENCE_JPEG_MAX_BYTES, MALLOC_CAP_8BIT);
+    }
+    if (s_inference_frame_buf == NULL) {
+        ESP_LOGE(TAG, "推論共有バッファ確保失敗");
+        return ESP_ERR_NO_MEM;
+    }
+
+    BaseType_t task_ok = xTaskCreate(inference_task,
+                                     "inference_task",
+                                     8192,
+                                     NULL,
+                                     tskIDLE_PRIORITY + 1,
+                                     &s_inference_task_handle);
+    if (task_ok != pdPASS) {
+        heap_caps_free(s_inference_frame_buf);
+        s_inference_frame_buf = NULL;
+        ESP_LOGE(TAG, "推論タスク作成失敗");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "推論タスク開始");
+    return ESP_OK;
 }
 
 static void update_face_monitor(bool is_face_detected, float confidence)
@@ -599,7 +723,7 @@ static esp_err_t init_camera(void)
         .ledc_channel = LEDC_CHANNEL_0,
         .pixel_format = PIXFORMAT_JPEG,
         .frame_size = FRAMESIZE_QVGA,
-        .jpeg_quality = 12,
+        .jpeg_quality = 10,
         .fb_count = 2,
         .fb_location = CAMERA_FB_IN_PSRAM,
         .grab_mode = CAMERA_GRAB_LATEST,
@@ -646,6 +770,14 @@ void app_main(void)
             ESP_LOGW(TAG, "推論初期化未完了: %s", esp_err_to_name(infer_init_err));
         } else {
             s_inference_status = INFERENCE_STATUS_OK;
+        }
+
+        if (s_camera_ready && infer_init_err == ESP_OK) {
+            esp_err_t task_err = start_inference_task();
+            if (task_err != ESP_OK) {
+                s_inference_status = INFERENCE_STATUS_FAULT;
+                ESP_LOGW(TAG, "推論タスク開始失敗: %s", esp_err_to_name(task_err));
+            }
         }
 
         ESP_ERROR_CHECK(start_http_server());
