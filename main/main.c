@@ -26,6 +26,7 @@
 #define STREAM_PACING_DELAY_MS 5
 #define INFERENCE_JPEG_MAX_BYTES (96 * 1024)
 #define FACE_CONFIDENCE_TH 0.45f
+#define FACE_DETECT_OK_STREAK_REQUIRED 3
 #define FACE_DETECT_HOLD_MS (1500)
 #define FACE_MISS_FAULT_MS (3 * 1000)
 
@@ -76,6 +77,9 @@ static esp_timer_handle_t s_wifi_retry_timer;
 static bool s_camera_ready;
 static inference_status_t s_inference_status = INFERENCE_STATUS_NOT_READY;
 static bool s_is_face_detected;
+static bool s_raw_face_detected;
+static bool s_face_detect_confirmed;
+static int s_face_detect_streak;
 static float s_face_confidence;
 static int64_t s_face_missing_started_ms = -1;
 static int64_t s_last_face_seen_ms = -1;
@@ -166,36 +170,57 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "<!doctype html>"
         "<html><head><meta charset=\"utf-8\"><title>顔認識監視</title>"
         "<style>"
+        "body{font-family:sans-serif;}"
         "#wrap{position:relative;width:320px;height:240px;display:inline-block;}"
         "#stream{width:320px;height:240px;display:block;}"
         "#face-box{position:absolute;border:2px solid red;display:none;pointer-events:none;box-sizing:border-box;}"
+        "#face-status{margin:12px 0 0;font-size:20px;font-weight:700;}"
+        "#face-status.ok{color:#0f766e;}"
+        "#face-status.ng{color:#b91c1c;}"
         "</style>"
         "</head>"
         "<body>"
         "<h1>顔認識監視</h1>"
         "<div id=\"wrap\">"
-        "<img src=\"http://\" onerror=\"this.outerHTML='<p>stream 読み込み失敗</p>'\" id=\"stream\" alt=\"stream\" width=\"320\" height=\"240\">"
+        "<img id=\"stream\" alt=\"stream\" width=\"320\" height=\"240\">"
         "<div id=\"face-box\"></div>"
         "</div>"
+        "<p id=\"face-status\" class=\"ng\">NG: 検出なし</p>"
         "<p>状態確認: <a href=\"/health\">/health</a></p>"
         "<p>枠座標: <a href=\"/face_box\">/face_box</a></p>"
         "<script>"
         "const img=document.getElementById('stream');"
         "const box=document.getElementById('face-box');"
+        "const status=document.getElementById('face-status');"
+        "img.onerror=()=>{img.outerHTML='<p>stream 読み込み失敗</p>';};"
         "img.src='http://'+location.hostname+':81/stream';"
         "const clamp=(v,min,max)=>Math.min(max,Math.max(min,v));"
+        "const updateStatus=(confirmed)=>{"
+        "status.textContent=confirmed?'OK: 顔検出':'NG: 検出なし';"
+        "status.className=confirmed?'ok':'ng';"
+        "};"
         "setInterval(async()=>{"
         "try{"
-        "const r=await fetch('/face_box',{cache:'no-store'});"
-        "if(!r.ok){box.style.display='none';return;}"
-        "const d=await r.json();"
-        "if(!d.detected){box.style.display='none';return;}"
+        "const [boxResp,healthResp]=await Promise.all(["
+        "fetch('/face_box',{cache:'no-store'}),"
+        "fetch('/health',{cache:'no-store'})"
+        "]);"
+        "if(!boxResp.ok){box.style.display='none';}else{"
+        "const d=await boxResp.json();"
+        "if(!d.detected){box.style.display='none';}else{"
         "const x0=clamp(d.x0,0,319),y0=clamp(d.y0,0,239),x1=clamp(d.x1,0,319),y1=clamp(d.y1,0,239);"
-        "if(x1<=x0||y1<=y0){box.style.display='none';return;}"
+        "if(x1<=x0||y1<=y0){box.style.display='none';}else{"
         "box.style.left=x0+'px';box.style.top=y0+'px';"
         "box.style.width=(x1-x0)+'px';box.style.height=(y1-y0)+'px';"
         "box.style.display='block';"
-        "}catch(e){box.style.display='none';}"
+        "}"
+        "}"
+        "}"
+        "if(!healthResp.ok){updateStatus(false);}else{"
+        "const h=await healthResp.json();"
+        "updateStatus(Boolean(h.face_detect_confirmed));"
+        "}"
+        "}catch(e){box.style.display='none';updateStatus(false);}"
         "},200);"
         "</script>"
         "</body></html>";
@@ -206,7 +231,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 
 static esp_err_t health_get_handler(httpd_req_t *req)
 {
-    char json[256];
+    char json[320];
     const char *wifi_status = s_wifi_connected ? "connected" : "disconnected";
     const char *camera_status = s_camera_ready ? "ok" : "fault";
     const char *inference_status = inference_status_to_string(s_inference_status);
@@ -214,13 +239,17 @@ static esp_err_t health_get_handler(httpd_req_t *req)
     int written = snprintf(json,
                            sizeof(json),
                            "{\"state\":\"%s\",\"wifi\":\"%s\",\"camera\":\"%s\",\"inference\":\"%s\","
-                           "\"face_detected\":%s,\"face_confidence\":%.3f}",
+                           "\"face_detected\":%s,\"face_confidence\":%.3f,"
+                           "\"face_raw_detected\":%s,\"face_detect_streak\":%d,\"face_detect_confirmed\":%s}",
                            state_to_string(s_system_state),
                            wifi_status,
                            camera_status,
                            inference_status,
                            s_is_face_detected ? "true" : "false",
-                           (double)s_face_confidence);
+                           (double)s_face_confidence,
+                           s_raw_face_detected ? "true" : "false",
+                           s_face_detect_streak,
+                           s_face_detect_confirmed ? "true" : "false");
     if (written < 0 || written >= (int)sizeof(json)) {
         return ESP_FAIL;
     }
@@ -470,6 +499,17 @@ static void update_face_monitor(bool is_face_detected, float confidence)
     bool raw_face_ok = is_face_detected && (confidence >= FACE_CONFIDENCE_TH);
 
     if (raw_face_ok) {
+        if (s_face_detect_streak < FACE_DETECT_OK_STREAK_REQUIRED) {
+            s_face_detect_streak++;
+        }
+    } else {
+        s_face_detect_streak = 0;
+    }
+
+    s_raw_face_detected = raw_face_ok;
+    s_face_detect_confirmed = raw_face_ok && (s_face_detect_streak >= FACE_DETECT_OK_STREAK_REQUIRED);
+
+    if (raw_face_ok) {
         s_last_face_seen_ms = now_ms;
         s_last_face_confidence = confidence;
     }
@@ -487,10 +527,12 @@ static void update_face_monitor(bool is_face_detected, float confidence)
     if (now_ms - s_last_face_log_ms >= 1000) {
         s_last_face_log_ms = now_ms;
         ESP_LOGI(TAG,
-                 "face monitor: detected=%d confidence=%.3f raw_ok=%d hold_ms=%d threshold=%.2f state=%s",
+                 "face monitor: detected=%d confidence=%.3f raw_ok=%d streak=%d confirmed=%d hold_ms=%d threshold=%.2f state=%s",
                  s_is_face_detected ? 1 : 0,
                  (double)s_face_confidence,
                  raw_face_ok ? 1 : 0,
+                 s_face_detect_streak,
+                 s_face_detect_confirmed ? 1 : 0,
                  (int)FACE_DETECT_HOLD_MS,
                  (double)FACE_CONFIDENCE_TH,
                  state_to_string(s_system_state));
