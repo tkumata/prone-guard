@@ -30,8 +30,10 @@
 #define STREAM_PACING_DELAY_MS 5
 #define UI_POLL_INTERVAL_MS 500
 #define INFERENCE_JPEG_MAX_BYTES (96 * 1024)
-#define FACE_CONFIDENCE_TH 0.45f
+#define FACE_OBSERVATION_HISTORY_SIZE 6
+#define FACE_CONFIDENCE_TH 0.35f
 #define FACE_DETECT_OK_STREAK_REQUIRED 3
+#define FACE_LOST_GRACE_MS (1200)
 #define PRONE_LIKE_MISSING_MS_TH (2000)
 #define PRONE_LIKE_LONG_MISSING_MS_TH (5000)
 #define PRONE_LIKE_PRE_DISAPPEAR_MOVE_TH (24.0f)
@@ -104,6 +106,7 @@ static bool s_raw_face_detected;
 static bool s_face_detect_confirmed;
 static int s_face_detect_streak;
 static float s_face_confidence;
+static int64_t s_last_face_detected_ms = -1;
 static int64_t s_face_missing_started_ms = -1;
 static int64_t s_last_inference_ms;
 static int64_t s_last_face_log_ms;
@@ -114,8 +117,9 @@ static float s_prone_like_score;
 static int s_face_missing_ms;
 static float s_pre_disappear_move_px;
 static float s_pre_disappear_area_drop;
-static face_observation_t s_prev_face_observation;
-static face_observation_t s_last_face_observation;
+static face_observation_t s_face_observation_history[FACE_OBSERVATION_HISTORY_SIZE];
+static size_t s_face_observation_count;
+static size_t s_face_observation_next_index;
 static SemaphoreHandle_t s_inference_frame_mutex;
 static uint8_t *s_inference_frame_buf;
 static size_t s_inference_frame_len;
@@ -208,12 +212,17 @@ static void update_face_observation(const prone_face_box_t *box, int64_t now_ms)
         return;
     }
 
-    s_prev_face_observation = s_last_face_observation;
-    s_last_face_observation.center_x = (box->x0 + box->x1) / 2;
-    s_last_face_observation.center_y = (box->y0 + box->y1) / 2;
-    s_last_face_observation.area = width * height;
-    s_last_face_observation.timestamp_ms = now_ms;
-    s_last_face_observation.valid = true;
+    face_observation_t *observation = &s_face_observation_history[s_face_observation_next_index];
+    observation->center_x = (box->x0 + box->x1) / 2;
+    observation->center_y = (box->y0 + box->y1) / 2;
+    observation->area = width * height;
+    observation->timestamp_ms = now_ms;
+    observation->valid = true;
+
+    s_face_observation_next_index = (s_face_observation_next_index + 1) % FACE_OBSERVATION_HISTORY_SIZE;
+    if (s_face_observation_count < FACE_OBSERVATION_HISTORY_SIZE) {
+        s_face_observation_count++;
+    }
 }
 
 static void capture_pre_disappear_metrics(void)
@@ -221,25 +230,48 @@ static void capture_pre_disappear_metrics(void)
     s_pre_disappear_move_px = 0.0f;
     s_pre_disappear_area_drop = 0.0f;
 
-    if (!s_last_face_observation.valid || !s_prev_face_observation.valid) {
+    if (s_face_observation_count < 2) {
         return;
     }
 
-    int64_t gap_ms = s_last_face_observation.timestamp_ms - s_prev_face_observation.timestamp_ms;
-    if (gap_ms <= 0 || gap_ms > PRE_DISAPPEAR_SAMPLE_MAX_GAP_MS) {
+    size_t latest_index =
+        (s_face_observation_next_index + FACE_OBSERVATION_HISTORY_SIZE - 1) % FACE_OBSERVATION_HISTORY_SIZE;
+    face_observation_t latest = s_face_observation_history[latest_index];
+    if (!latest.valid) {
         return;
     }
 
-    int dx = s_last_face_observation.center_x - s_prev_face_observation.center_x;
-    int dy = s_last_face_observation.center_y - s_prev_face_observation.center_y;
-    float move_px = sqrtf((float)(dx * dx + dy * dy));
-    if (move_px > 0.0f) {
-        s_pre_disappear_move_px = move_px;
+    int max_area = latest.area;
+    for (size_t offset = 1; offset < s_face_observation_count; ++offset) {
+        size_t index =
+            (s_face_observation_next_index + FACE_OBSERVATION_HISTORY_SIZE - 1 - offset) % FACE_OBSERVATION_HISTORY_SIZE;
+        face_observation_t observation = s_face_observation_history[index];
+        if (!observation.valid) {
+            continue;
+        }
+
+        int64_t gap_ms = latest.timestamp_ms - observation.timestamp_ms;
+        if (gap_ms <= 0) {
+            continue;
+        }
+        if (gap_ms > PRE_DISAPPEAR_SAMPLE_MAX_GAP_MS) {
+            break;
+        }
+
+        int dx = latest.center_x - observation.center_x;
+        int dy = latest.center_y - observation.center_y;
+        float move_px = sqrtf((float)(dx * dx + dy * dy));
+        if (move_px > s_pre_disappear_move_px) {
+            s_pre_disappear_move_px = move_px;
+        }
+
+        if (observation.area > max_area) {
+            max_area = observation.area;
+        }
     }
 
-    if (s_prev_face_observation.area > 0 && s_last_face_observation.area < s_prev_face_observation.area) {
-        s_pre_disappear_area_drop =
-            ((float)(s_prev_face_observation.area - s_last_face_observation.area)) / (float)s_prev_face_observation.area;
+    if (max_area > 0 && latest.area < max_area) {
+        s_pre_disappear_area_drop = ((float)(max_area - latest.area)) / (float)max_area;
     }
 }
 
@@ -650,6 +682,11 @@ static void update_face_monitor(bool is_face_detected, float confidence)
 
     s_raw_face_detected = raw_face_ok;
     s_face_detect_confirmed = raw_face_ok && (s_face_detect_streak >= FACE_DETECT_OK_STREAK_REQUIRED);
+    if (raw_face_ok) {
+        s_last_face_detected_ms = now_ms;
+    }
+    bool face_present =
+        raw_face_ok || (s_last_face_detected_ms >= 0 && (now_ms - s_last_face_detected_ms) <= FACE_LOST_GRACE_MS);
 
     if (s_inference_status == INFERENCE_STATUS_FAULT) {
         s_is_face_detected = false;
@@ -667,8 +704,10 @@ static void update_face_monitor(bool is_face_detected, float confidence)
         return;
     }
 
-    if (raw_face_ok) {
-        update_face_observation(&s_last_face_box, now_ms);
+    if (face_present) {
+        if (raw_face_ok) {
+            update_face_observation(&s_last_face_box, now_ms);
+        }
         s_face_missing_started_ms = -1;
         s_face_missing_ms = 0;
         s_prone_like_score = 0.0f;
@@ -689,8 +728,12 @@ static void update_face_monitor(bool is_face_detected, float confidence)
         s_monitor_status = s_prone_like_detected ? MONITOR_STATUS_NG : MONITOR_STATUS_UNKNOWN;
     }
 
-    s_is_face_detected = raw_face_ok;
-    s_face_confidence = raw_face_ok ? confidence : 0.0f;
+    s_is_face_detected = face_present;
+    if (raw_face_ok) {
+        s_face_confidence = confidence;
+    } else if (!face_present) {
+        s_face_confidence = 0.0f;
+    }
 
     if (now_ms - s_last_face_log_ms >= 1000) {
         s_last_face_log_ms = now_ms;
@@ -710,7 +753,7 @@ static void update_face_monitor(bool is_face_detected, float confidence)
                  state_to_string(s_system_state));
     }
 
-    if (raw_face_ok) {
+    if (face_present) {
         if ((s_system_state == SYSTEM_STATE_ALERT || s_system_state == SYSTEM_STATE_FAULT_INFERENCE) && s_camera_ready) {
             set_system_state(SYSTEM_STATE_MONITORING);
         }
