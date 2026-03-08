@@ -61,7 +61,19 @@
    idf.py set-target esp32s3
    ```
 
-3. 初回ビルド
+3. プロジェクト設定
+   - 次を実行し、設定画面を開く
+
+   ```bash
+   idf.py menuconfig
+   ```
+
+   - `Prone Guard Configuration` を開き、以下の項目を設定する
+     - `WiFi SSID`: 接続先アクセスポイントの SSID
+     - `WiFi Password`: 接続先アクセスポイントのパスワード (8文字以上)
+   - 設定を保存して終了する (Q キー押下後、Y キーで保存)
+
+4. 初回ビルド
 
    ```bash
    idf.py build
