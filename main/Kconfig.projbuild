@@ -1,0 +1,15 @@
+menu "Prone Guard Configuration"
+
+config WIFI_SSID
+    string "WiFi SSID"
+    default ""
+    help
+        SSID for the WiFi connection. Required for operation.
+
+config WIFI_PASSWORD
+    string "WiFi Password"
+    default ""
+    help
+        Password for the WiFi connection. Must be at least 8 characters long.
+
+endmenu

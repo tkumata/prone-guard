@@ -1,9 +1,11 @@
 #include <stdbool.h>
 #include <stdint.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "esp_event.h"
+#include "esp_heap_caps.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_netif.h"
@@ -12,18 +14,42 @@
 #include "esp_camera.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 #include "nvs_flash.h"
 #include "prone_inference_bridge.h"
 
-#define WIFI_SSID "SSID"
-#define WIFI_PASSWORD "REMOVED"
+#if !defined(CONFIG_WIFI_SSID) || !defined(CONFIG_WIFI_PASSWORD)
+#error "WiFi credentials must be configured via menuconfig (Prone Guard Configuration)"
+#endif
+
+// 空文字列チェック。sizeof("") は終端文字を含むため 1
+_Static_assert(sizeof(CONFIG_WIFI_SSID) > 1, "CONFIG_WIFI_SSID must not be empty");
+
+// 文字数チェック。WPA要件である8文字以上。sizeof("12345678") は 9
+_Static_assert(sizeof(CONFIG_WIFI_PASSWORD) >= 9, "CONFIG_WIFI_PASSWORD must be at least 8 characters long");
+
+#define WIFI_SSID CONFIG_WIFI_SSID
+#define WIFI_PASSWORD CONFIG_WIFI_PASSWORD
+
+#define STRINGIFY_INNER(x) #x
+#define STRINGIFY(x) STRINGIFY_INNER(x)
 
 #define WIFI_RETRY_INTERVAL_MS 5000
 #define WIFI_CONNECTED_BIT BIT0
-#define FRAME_INTERVAL_MS 500
-#define FACE_CONFIDENCE_TH 0.50f
-#define FACE_DETECT_HOLD_MS (1500)
-#define FACE_MISS_FAULT_MS (3 * 1000)
+#define INFERENCE_INTERVAL_MS 500
+#define STREAM_PACING_DELAY_MS 5
+#define UI_POLL_INTERVAL_MS 500
+#define INFERENCE_JPEG_MAX_BYTES (96 * 1024)
+#define FACE_OBSERVATION_HISTORY_SIZE 6
+#define FACE_CONFIDENCE_TH 0.35f
+#define FACE_DETECT_OK_STREAK_REQUIRED 3
+#define FACE_LOST_GRACE_MS (1200)
+#define PRONE_LIKE_MISSING_MS_TH (2000)
+#define PRONE_LIKE_LONG_MISSING_MS_TH (7000)
+#define PRONE_LIKE_PRE_DISAPPEAR_MOVE_TH (24.0f)
+#define PRONE_LIKE_AREA_DROP_TH (0.20f)
+#define PRONE_LIKE_SCORE_TH (0.70f)
+#define PRE_DISAPPEAR_SAMPLE_MAX_GAP_MS (1500)
 
 // Freenove ESP32-S3 WROOM CAM (OV2640) 想定ピン定義
 #define CAM_PIN_PWDN -1
@@ -62,6 +88,20 @@ typedef enum {
     INFERENCE_STATUS_FAULT,
 } inference_status_t;
 
+typedef enum {
+    MONITOR_STATUS_UNKNOWN = 0,
+    MONITOR_STATUS_OK,
+    MONITOR_STATUS_NG,
+} monitor_status_t;
+
+typedef struct {
+    int center_x;
+    int center_y;
+    int area;
+    int64_t timestamp_ms;
+    bool valid;
+} face_observation_t;
+
 static EventGroupHandle_t s_wifi_event_group;
 static httpd_handle_t s_http_server;
 static httpd_handle_t s_stream_http_server;
@@ -72,17 +112,36 @@ static esp_timer_handle_t s_wifi_retry_timer;
 static bool s_camera_ready;
 static inference_status_t s_inference_status = INFERENCE_STATUS_NOT_READY;
 static bool s_is_face_detected;
+static bool s_raw_face_detected;
+static bool s_face_detect_confirmed;
+static int s_face_detect_streak;
 static float s_face_confidence;
+static int64_t s_last_face_detected_ms = -1;
 static int64_t s_face_missing_started_ms = -1;
-static int64_t s_last_face_seen_ms = -1;
-static float s_last_face_confidence;
 static int64_t s_last_inference_ms;
 static int64_t s_last_face_log_ms;
 static prone_face_box_t s_last_face_box;
+static monitor_status_t s_monitor_status = MONITOR_STATUS_UNKNOWN;
+static bool s_prone_like_detected;
+static float s_prone_like_score;
+static int s_face_missing_ms;
+static float s_pre_disappear_move_px;
+static float s_pre_disappear_area_drop;
+static face_observation_t s_face_observation_history[FACE_OBSERVATION_HISTORY_SIZE];
+static size_t s_face_observation_count;
+static size_t s_face_observation_next_index;
+static SemaphoreHandle_t s_inference_frame_mutex;
+static uint8_t *s_inference_frame_buf;
+static size_t s_inference_frame_len;
+static bool s_inference_frame_pending;
+static TaskHandle_t s_inference_task_handle;
 
 static esp_err_t run_prone_inference(camera_fb_t *fb, bool *is_face_detected, float *confidence);
 static void update_face_monitor(bool is_face_detected, float confidence);
 static esp_err_t face_box_get_handler(httpd_req_t *req);
+static bool publish_frame_for_inference(camera_fb_t *fb);
+static void inference_task(void *arg);
+static esp_err_t start_inference_task(void);
 
 static const char *state_to_string(system_state_t state)
 {
@@ -122,6 +181,19 @@ static const char *inference_status_to_string(inference_status_t status)
     }
 }
 
+static const char *monitor_status_to_string(monitor_status_t status)
+{
+    switch (status) {
+    case MONITOR_STATUS_OK:
+        return "ok";
+    case MONITOR_STATUS_NG:
+        return "ng";
+    case MONITOR_STATUS_UNKNOWN:
+    default:
+        return "unknown";
+    }
+}
+
 static inference_status_t from_bridge_status(prone_inference_status_t status)
 {
     switch (status) {
@@ -138,6 +210,101 @@ static inference_status_t from_bridge_status(prone_inference_status_t status)
     }
 }
 
+static void update_face_observation(const prone_face_box_t *box, int64_t now_ms)
+{
+    if (box == NULL || !box->valid) {
+        return;
+    }
+
+    int width = box->x1 - box->x0;
+    int height = box->y1 - box->y0;
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+
+    face_observation_t *observation = &s_face_observation_history[s_face_observation_next_index];
+    observation->center_x = (box->x0 + box->x1) / 2;
+    observation->center_y = (box->y0 + box->y1) / 2;
+    observation->area = width * height;
+    observation->timestamp_ms = now_ms;
+    observation->valid = true;
+
+    s_face_observation_next_index = (s_face_observation_next_index + 1) % FACE_OBSERVATION_HISTORY_SIZE;
+    if (s_face_observation_count < FACE_OBSERVATION_HISTORY_SIZE) {
+        s_face_observation_count++;
+    }
+}
+
+static void capture_pre_disappear_metrics(void)
+{
+    s_pre_disappear_move_px = 0.0f;
+    s_pre_disappear_area_drop = 0.0f;
+
+    if (s_face_observation_count < 2) {
+        return;
+    }
+
+    size_t latest_index =
+        (s_face_observation_next_index + FACE_OBSERVATION_HISTORY_SIZE - 1) % FACE_OBSERVATION_HISTORY_SIZE;
+    face_observation_t latest = s_face_observation_history[latest_index];
+    if (!latest.valid) {
+        return;
+    }
+
+    int max_area = latest.area;
+    for (size_t offset = 1; offset < s_face_observation_count; ++offset) {
+        size_t index =
+            (s_face_observation_next_index + FACE_OBSERVATION_HISTORY_SIZE - 1 - offset) % FACE_OBSERVATION_HISTORY_SIZE;
+        face_observation_t observation = s_face_observation_history[index];
+        if (!observation.valid) {
+            continue;
+        }
+
+        int64_t gap_ms = latest.timestamp_ms - observation.timestamp_ms;
+        if (gap_ms <= 0) {
+            continue;
+        }
+        if (gap_ms > PRE_DISAPPEAR_SAMPLE_MAX_GAP_MS) {
+            break;
+        }
+
+        int dx = latest.center_x - observation.center_x;
+        int dy = latest.center_y - observation.center_y;
+        float move_px = sqrtf((float)(dx * dx + dy * dy));
+        if (move_px > s_pre_disappear_move_px) {
+            s_pre_disappear_move_px = move_px;
+        }
+
+        if (observation.area > max_area) {
+            max_area = observation.area;
+        }
+    }
+
+    if (max_area > 0 && latest.area < max_area) {
+        s_pre_disappear_area_drop = ((float)(max_area - latest.area)) / (float)max_area;
+    }
+}
+
+static float compute_prone_like_score(int missing_ms, float pre_disappear_move_px, float pre_disappear_area_drop)
+{
+    float score = 0.0f;
+
+    if (missing_ms >= PRONE_LIKE_MISSING_MS_TH) {
+        score += 0.55f;
+    }
+    if (missing_ms >= PRONE_LIKE_LONG_MISSING_MS_TH) {
+        score += 0.20f;
+    }
+    if (pre_disappear_move_px >= PRONE_LIKE_PRE_DISAPPEAR_MOVE_TH) {
+        score += 0.25f;
+    }
+    if (pre_disappear_area_drop >= PRONE_LIKE_AREA_DROP_TH) {
+        score += 0.20f;
+    }
+
+    return score;
+}
+
 static void set_system_state(system_state_t next_state)
 {
     if (s_system_state == next_state) {
@@ -148,97 +315,151 @@ static void set_system_state(system_state_t next_state)
     s_system_state = next_state;
 }
 
+static bool get_reportable_face_box(prone_face_box_t *box)
+{
+    if (box == NULL) {
+        return false;
+    }
+
+    *box = s_last_face_box;
+    bool detected = s_is_face_detected && box->valid;
+    if (!detected) {
+        return false;
+    }
+
+    if (box->x0 < 0) {
+        box->x0 = 0;
+    }
+    if (box->y0 < 0) {
+        box->y0 = 0;
+    }
+    if (box->x1 > 319) {
+        box->x1 = 319;
+    }
+    if (box->y1 > 239) {
+        box->y1 = 239;
+    }
+
+    return box->x1 > box->x0 && box->y1 > box->y0;
+}
+
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
     static const char html[] =
         "<!doctype html>"
-        "<html><head><meta charset=\"utf-8\"><title>顔認識監視</title>"
+        "<html><head><meta charset=\"utf-8\"><title>prone-like 監視</title>"
         "<style>"
+        "body{font-family:sans-serif;}"
         "#wrap{position:relative;width:320px;height:240px;display:inline-block;}"
         "#stream{width:320px;height:240px;display:block;}"
         "#face-box{position:absolute;border:2px solid red;display:none;pointer-events:none;box-sizing:border-box;}"
+        "#face-status{margin:12px 0 0;font-size:20px;font-weight:700;}"
+        "#face-status.ok{color:#0f766e;}"
+        "#face-status.ng{color:#b91c1c;}"
+        "#face-status.unknown{color:#a16207;}"
         "</style>"
         "</head>"
         "<body>"
-        "<h1>顔認識監視</h1>"
+        "<h1>prone-like 監視</h1>"
         "<div id=\"wrap\">"
-        "<img src=\"http://\" onerror=\"this.outerHTML='<p>stream 読み込み失敗</p>'\" id=\"stream\" alt=\"stream\" width=\"320\" height=\"240\">"
+        "<img id=\"stream\" alt=\"stream\" width=\"320\" height=\"240\">"
         "<div id=\"face-box\"></div>"
         "</div>"
+        "<p id=\"face-status\" class=\"unknown\">UNKNOWN: 顔未検出</p>"
         "<p>状態確認: <a href=\"/health\">/health</a></p>"
         "<p>枠座標: <a href=\"/face_box\">/face_box</a></p>"
         "<script>"
         "const img=document.getElementById('stream');"
         "const box=document.getElementById('face-box');"
+        "const status=document.getElementById('face-status');"
+        "img.onerror=()=>{img.outerHTML='<p>stream 読み込み失敗</p>';};"
         "img.src='http://'+location.hostname+':81/stream';"
         "const clamp=(v,min,max)=>Math.min(max,Math.max(min,v));"
+        "const updateStatus=(monitorStatus)=>{"
+        "if(monitorStatus==='ok'){status.textContent='OK: 顔検出';status.className='ok';return;}"
+        "if(monitorStatus==='ng'){status.textContent='NG: prone-like';status.className='ng';return;}"
+        "status.textContent='UNKNOWN: 顔未検出';status.className='unknown';"
+        "};"
         "setInterval(async()=>{"
         "try{"
-        "const r=await fetch('/face_box',{cache:'no-store'});"
-        "if(!r.ok){box.style.display='none';return;}"
-        "const d=await r.json();"
-        "if(!d.detected){box.style.display='none';return;}"
+        "const healthResp=await fetch('/health',{cache:'no-store'});"
+        "if(!healthResp.ok){box.style.display='none';updateStatus('unknown');}else{"
+        "const h=await healthResp.json();"
+        "updateStatus(typeof h.monitor_status==='string'?h.monitor_status:'unknown');"
+        "const d=h.face_box;"
+        "if(!d||!d.detected){box.style.display='none';}else{"
         "const x0=clamp(d.x0,0,319),y0=clamp(d.y0,0,239),x1=clamp(d.x1,0,319),y1=clamp(d.y1,0,239);"
-        "if(x1<=x0||y1<=y0){box.style.display='none';return;}"
+        "if(x1<=x0||y1<=y0){box.style.display='none';}else{"
         "box.style.left=x0+'px';box.style.top=y0+'px';"
         "box.style.width=(x1-x0)+'px';box.style.height=(y1-y0)+'px';"
         "box.style.display='block';"
-        "}catch(e){box.style.display='none';}"
-        "},200);"
+        "}"
+        "}"
+        "}"
+        "}catch(e){box.style.display='none';updateStatus('unknown');}"
+        "}," STRINGIFY(UI_POLL_INTERVAL_MS) ");"
         "</script>"
         "</body></html>";
 
     httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Connection", "close");
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t health_get_handler(httpd_req_t *req)
 {
-    char json[256];
+    char json[640];
     const char *wifi_status = s_wifi_connected ? "connected" : "disconnected";
     const char *camera_status = s_camera_ready ? "ok" : "fault";
     const char *inference_status = inference_status_to_string(s_inference_status);
+    prone_face_box_t box;
+    bool detected = get_reportable_face_box(&box);
 
     int written = snprintf(json,
                            sizeof(json),
                            "{\"state\":\"%s\",\"wifi\":\"%s\",\"camera\":\"%s\",\"inference\":\"%s\","
-                           "\"face_detected\":%s,\"face_confidence\":%.3f}",
+                           "\"face_detected\":%s,\"face_confidence\":%.3f,"
+                           "\"face_raw_detected\":%s,\"face_detect_streak\":%d,\"face_detect_confirmed\":%s,"
+                           "\"monitor_status\":\"%s\",\"prone_like\":%s,\"prone_like_score\":%.3f,"
+                           "\"face_missing_ms\":%d,\"pre_disappear_move_px\":%.1f,\"pre_disappear_area_drop\":%.3f,"
+                           "\"face_box\":{\"detected\":%s,\"x0\":%d,\"y0\":%d,\"x1\":%d,\"y1\":%d,\"confidence\":%.3f}}",
                            state_to_string(s_system_state),
                            wifi_status,
                            camera_status,
                            inference_status,
                            s_is_face_detected ? "true" : "false",
-                           (double)s_face_confidence);
+                           (double)s_face_confidence,
+                           s_raw_face_detected ? "true" : "false",
+                           s_face_detect_streak,
+                           s_face_detect_confirmed ? "true" : "false",
+                           monitor_status_to_string(s_monitor_status),
+                           s_prone_like_detected ? "true" : "false",
+                           (double)s_prone_like_score,
+                           s_face_missing_ms,
+                           (double)s_pre_disappear_move_px,
+                           (double)s_pre_disappear_area_drop,
+                           detected ? "true" : "false",
+                           detected ? box.x0 : -1,
+                           detected ? box.y0 : -1,
+                           detected ? box.x1 : -1,
+                           detected ? box.y1 : -1,
+                           (double)(detected ? box.confidence : 0.0f));
     if (written < 0 || written >= (int)sizeof(json)) {
         return ESP_FAIL;
     }
 
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Connection", "close");
     return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t face_box_get_handler(httpd_req_t *req)
 {
     char json[192];
-    prone_face_box_t box = s_last_face_box;
-    bool detected = s_is_face_detected && box.valid;
-    if (detected) {
-        if (box.x0 < 0) {
-            box.x0 = 0;
-        }
-        if (box.y0 < 0) {
-            box.y0 = 0;
-        }
-        if (box.x1 > 319) {
-            box.x1 = 319;
-        }
-        if (box.y1 > 239) {
-            box.y1 = 239;
-        }
-        if (box.x1 <= box.x0 || box.y1 <= box.y0) {
-            detected = false;
-        }
-    }
+    prone_face_box_t box;
+    bool detected = get_reportable_face_box(&box);
 
     int written = snprintf(json,
                            sizeof(json),
@@ -254,6 +475,8 @@ static esp_err_t face_box_get_handler(httpd_req_t *req)
     }
 
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Connection", "close");
     return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
 }
 
@@ -269,6 +492,7 @@ static esp_err_t stream_get_handler(httpd_req_t *req)
     static const char *stream_content_type = "multipart/x-mixed-replace;boundary=frame";
     static const char *stream_boundary = "\r\n--frame\r\n";
     char part_header[64];
+    esp_err_t stream_err = ESP_OK;
 
     httpd_resp_set_type(req, stream_content_type);
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
@@ -282,15 +506,10 @@ static esp_err_t stream_get_handler(httpd_req_t *req)
         }
 
         int64_t now_ms = esp_timer_get_time() / 1000;
-        if (now_ms - s_last_inference_ms >= FRAME_INTERVAL_MS) {
-            s_last_inference_ms = now_ms;
-            esp_err_t infer_err = run_prone_inference(fb, &s_is_face_detected, &s_face_confidence);
-            if (infer_err == ESP_OK) {
-                s_inference_status = INFERENCE_STATUS_OK;
-            } else if (infer_err != ESP_ERR_NOT_FOUND) {
-                s_inference_status = INFERENCE_STATUS_FAULT;
+        if ((now_ms - s_last_inference_ms) >= INFERENCE_INTERVAL_MS) {
+            if (publish_frame_for_inference(fb)) {
+                s_last_inference_ms = now_ms;
             }
-            update_face_monitor(s_is_face_detected, s_face_confidence);
         }
 
         int hlen = snprintf(part_header,
@@ -302,26 +521,27 @@ static esp_err_t stream_get_handler(httpd_req_t *req)
             return ESP_FAIL;
         }
 
-        esp_err_t err = httpd_resp_send_chunk(req, stream_boundary, strlen(stream_boundary));
-        if (err == ESP_OK) {
-            err = httpd_resp_send_chunk(req, part_header, hlen);
+        stream_err = httpd_resp_send_chunk(req, stream_boundary, strlen(stream_boundary));
+        if (stream_err == ESP_OK) {
+            stream_err = httpd_resp_send_chunk(req, part_header, hlen);
         }
-        if (err == ESP_OK) {
-            err = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+        if (stream_err == ESP_OK) {
+            stream_err = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
         }
-        if (err == ESP_OK) {
-            err = httpd_resp_send_chunk(req, "\r\n", 2);
+        if (stream_err == ESP_OK) {
+            stream_err = httpd_resp_send_chunk(req, "\r\n", 2);
         }
 
         esp_camera_fb_return(fb);
-        if (err != ESP_OK) {
+        if (stream_err != ESP_OK) {
             break;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(30));
+        vTaskDelay(pdMS_TO_TICKS(STREAM_PACING_DELAY_MS));
     }
 
-    return ESP_OK;
+    ESP_LOGI(TAG, "ストリーム接続終了: %s", esp_err_to_name(stream_err));
+    return stream_err;
 }
 
 static esp_err_t run_prone_inference(camera_fb_t *fb, bool *is_face_detected, float *confidence)
@@ -340,55 +560,224 @@ static esp_err_t run_prone_inference(camera_fb_t *fb, bool *is_face_detected, fl
     return err;
 }
 
+static bool publish_frame_for_inference(camera_fb_t *fb)
+{
+    if (fb == NULL || fb->buf == NULL || fb->len == 0) {
+        return false;
+    }
+
+    if (fb->len > INFERENCE_JPEG_MAX_BYTES) {
+        ESP_LOGW(TAG, "推論用 JPEG が大きすぎるためスキップ: %u bytes", (unsigned)fb->len);
+        return false;
+    }
+
+    if (s_inference_frame_buf == NULL || s_inference_frame_mutex == NULL) {
+        return false;
+    }
+
+    if (xSemaphoreTake(s_inference_frame_mutex, pdMS_TO_TICKS(5)) != pdTRUE) {
+        return false;
+    }
+
+    memcpy(s_inference_frame_buf, fb->buf, fb->len);
+    s_inference_frame_len = fb->len;
+    s_inference_frame_pending = true;
+    xSemaphoreGive(s_inference_frame_mutex);
+    return true;
+}
+
+static void inference_task(void *arg)
+{
+    (void)arg;
+
+    uint8_t *work_buf = (uint8_t *)heap_caps_malloc(INFERENCE_JPEG_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (work_buf == NULL) {
+        work_buf = (uint8_t *)heap_caps_malloc(INFERENCE_JPEG_MAX_BYTES, MALLOC_CAP_8BIT);
+    }
+    if (work_buf == NULL) {
+        ESP_LOGE(TAG, "推論タスク作業バッファ確保失敗");
+        s_inference_status = INFERENCE_STATUS_FAULT;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    while (true) {
+        size_t frame_len = 0;
+
+        if (xSemaphoreTake(s_inference_frame_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            if (s_inference_frame_pending && s_inference_frame_len > 0) {
+                frame_len = s_inference_frame_len;
+                memcpy(work_buf, s_inference_frame_buf, frame_len);
+                s_inference_frame_pending = false;
+            }
+            xSemaphoreGive(s_inference_frame_mutex);
+        }
+
+        if (frame_len == 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        camera_fb_t fb = {
+            .buf = work_buf,
+            .len = frame_len,
+            .width = 320,
+            .height = 240,
+            .format = PIXFORMAT_JPEG,
+        };
+        bool is_face_detected = false;
+        float confidence = 0.0f;
+        esp_err_t infer_err = run_prone_inference(&fb, &is_face_detected, &confidence);
+        if (infer_err == ESP_OK) {
+            s_inference_status = INFERENCE_STATUS_OK;
+        } else if (infer_err != ESP_ERR_NOT_FOUND) {
+            s_inference_status = INFERENCE_STATUS_FAULT;
+        }
+        update_face_monitor(is_face_detected, confidence);
+    }
+}
+
+static esp_err_t start_inference_task(void)
+{
+    if (s_inference_task_handle != NULL) {
+        return ESP_OK;
+    }
+
+    if (s_inference_frame_mutex == NULL) {
+        s_inference_frame_mutex = xSemaphoreCreateMutex();
+        if (s_inference_frame_mutex == NULL) {
+            ESP_LOGE(TAG, "推論共有ミューテックス確保失敗");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
+    s_inference_frame_buf = (uint8_t *)heap_caps_malloc(INFERENCE_JPEG_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_inference_frame_buf == NULL) {
+        s_inference_frame_buf = (uint8_t *)heap_caps_malloc(INFERENCE_JPEG_MAX_BYTES, MALLOC_CAP_8BIT);
+    }
+    if (s_inference_frame_buf == NULL) {
+        ESP_LOGE(TAG, "推論共有バッファ確保失敗");
+        return ESP_ERR_NO_MEM;
+    }
+
+    BaseType_t task_ok = xTaskCreate(inference_task,
+                                     "inference_task",
+                                     8192,
+                                     NULL,
+                                     tskIDLE_PRIORITY + 1,
+                                     &s_inference_task_handle);
+    if (task_ok != pdPASS) {
+        heap_caps_free(s_inference_frame_buf);
+        s_inference_frame_buf = NULL;
+        ESP_LOGE(TAG, "推論タスク作成失敗");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "推論タスク開始");
+    return ESP_OK;
+}
+
 static void update_face_monitor(bool is_face_detected, float confidence)
 {
     int64_t now_ms = esp_timer_get_time() / 1000;
     bool raw_face_ok = is_face_detected && (confidence >= FACE_CONFIDENCE_TH);
 
     if (raw_face_ok) {
-        s_last_face_seen_ms = now_ms;
-        s_last_face_confidence = confidence;
+        if (s_face_detect_streak < FACE_DETECT_OK_STREAK_REQUIRED) {
+            s_face_detect_streak++;
+        }
+    } else {
+        s_face_detect_streak = 0;
     }
 
-    bool face_ok = raw_face_ok;
-    if (!face_ok && s_last_face_seen_ms >= 0 && (now_ms - s_last_face_seen_ms) <= FACE_DETECT_HOLD_MS) {
-        face_ok = true;
-        is_face_detected = true;
-        confidence = s_last_face_confidence;
+    s_raw_face_detected = raw_face_ok;
+    s_face_detect_confirmed = raw_face_ok && (s_face_detect_streak >= FACE_DETECT_OK_STREAK_REQUIRED);
+    if (raw_face_ok) {
+        s_last_face_detected_ms = now_ms;
+    }
+    bool face_present =
+        raw_face_ok || (s_last_face_detected_ms >= 0 && (now_ms - s_last_face_detected_ms) <= FACE_LOST_GRACE_MS);
+
+    if (s_inference_status == INFERENCE_STATUS_FAULT) {
+        s_is_face_detected = false;
+        s_face_confidence = 0.0f;
+        s_monitor_status = MONITOR_STATUS_UNKNOWN;
+        s_prone_like_detected = false;
+        s_prone_like_score = 0.0f;
+        s_face_missing_started_ms = -1;
+        s_face_missing_ms = 0;
+        s_pre_disappear_move_px = 0.0f;
+        s_pre_disappear_area_drop = 0.0f;
+        if (s_system_state != SYSTEM_STATE_FAULT_CAMERA) {
+            set_system_state(SYSTEM_STATE_FAULT_INFERENCE);
+        }
+        return;
     }
 
-    s_is_face_detected = face_ok;
-    s_face_confidence = face_ok ? confidence : 0.0f;
+    if (face_present) {
+        if (raw_face_ok) {
+            update_face_observation(&s_last_face_box, now_ms);
+        }
+        s_face_missing_started_ms = -1;
+        s_face_missing_ms = 0;
+        s_prone_like_score = 0.0f;
+        s_prone_like_detected = false;
+        s_pre_disappear_move_px = 0.0f;
+        s_pre_disappear_area_drop = 0.0f;
+        s_monitor_status = MONITOR_STATUS_OK;
+    } else {
+        if (s_face_missing_started_ms < 0) {
+            s_face_missing_started_ms = now_ms;
+            capture_pre_disappear_metrics();
+        }
+
+        s_face_missing_ms = (int)(now_ms - s_face_missing_started_ms);
+        s_prone_like_score =
+            compute_prone_like_score(s_face_missing_ms, s_pre_disappear_move_px, s_pre_disappear_area_drop);
+        s_prone_like_detected = (s_prone_like_score >= PRONE_LIKE_SCORE_TH);
+        s_monitor_status = s_prone_like_detected ? MONITOR_STATUS_NG : MONITOR_STATUS_UNKNOWN;
+    }
+
+    s_is_face_detected = face_present;
+    if (raw_face_ok) {
+        s_face_confidence = confidence;
+    } else if (!face_present) {
+        s_face_confidence = 0.0f;
+    }
 
     if (now_ms - s_last_face_log_ms >= 1000) {
         s_last_face_log_ms = now_ms;
         ESP_LOGI(TAG,
-                 "face monitor: detected=%d confidence=%.3f raw_ok=%d hold_ms=%d threshold=%.2f state=%s",
+                 "monitor: face=%d confidence=%.3f raw_ok=%d streak=%d confirmed=%d missing_ms=%d move_px=%.1f area_drop=%.3f prone_score=%.2f prone_like=%d label=%s state=%s",
                  s_is_face_detected ? 1 : 0,
                  (double)s_face_confidence,
                  raw_face_ok ? 1 : 0,
-                 (int)FACE_DETECT_HOLD_MS,
-                 (double)FACE_CONFIDENCE_TH,
+                 s_face_detect_streak,
+                 s_face_detect_confirmed ? 1 : 0,
+                 s_face_missing_ms,
+                 (double)s_pre_disappear_move_px,
+                 (double)s_pre_disappear_area_drop,
+                 (double)s_prone_like_score,
+                 s_prone_like_detected ? 1 : 0,
+                 monitor_status_to_string(s_monitor_status),
                  state_to_string(s_system_state));
     }
 
-    if (face_ok) {
-        s_face_missing_started_ms = -1;
-        if (s_system_state == SYSTEM_STATE_FAULT_INFERENCE && s_camera_ready) {
+    if (face_present) {
+        if ((s_system_state == SYSTEM_STATE_ALERT || s_system_state == SYSTEM_STATE_FAULT_INFERENCE) && s_camera_ready) {
             set_system_state(SYSTEM_STATE_MONITORING);
         }
         return;
     }
 
-    if (s_face_missing_started_ms < 0) {
-        s_face_missing_started_ms = now_ms;
+    if (s_system_state == SYSTEM_STATE_FAULT_CAMERA) {
+        return;
     }
 
-    if ((now_ms - s_face_missing_started_ms) >= FACE_MISS_FAULT_MS) {
-        s_inference_status = INFERENCE_STATUS_FAULT;
-        if (s_system_state != SYSTEM_STATE_FAULT_CAMERA) {
-            set_system_state(SYSTEM_STATE_FAULT_INFERENCE);
-        }
+    if (s_prone_like_detected) {
+        set_system_state(SYSTEM_STATE_ALERT);
+    } else if (s_camera_ready) {
+        set_system_state(SYSTEM_STATE_MONITORING);
     }
 }
 
@@ -400,6 +789,7 @@ static esp_err_t start_http_server(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
+    config.keep_alive_enable = false;
 
     esp_err_t err = httpd_start(&s_http_server, &config);
     if (err != ESP_OK) {
@@ -445,6 +835,7 @@ static esp_err_t start_stream_http_server(void)
     config.server_port = 81;
     config.ctrl_port = 32769;
     config.lru_purge_enable = true;
+    config.keep_alive_enable = false;
 
     esp_err_t err = httpd_start(&s_stream_http_server, &config);
     if (err != ESP_OK) {
@@ -512,10 +903,15 @@ static void wifi_event_handler(void *arg,
     }
 
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         s_wifi_connected = true;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         set_system_state(SYSTEM_STATE_READY);
-        ESP_LOGI(TAG, "Wi-Fi 接続完了");
+        ESP_LOGI(TAG,
+                 "Wi-Fi 接続完了 ip=" IPSTR " root=http://" IPSTR "/ stream=http://" IPSTR ":81/stream",
+                 IP2STR(&event->ip_info.ip),
+                 IP2STR(&event->ip_info.ip),
+                 IP2STR(&event->ip_info.ip));
     }
 }
 
@@ -594,15 +990,15 @@ static esp_err_t init_camera(void)
         .pin_vsync = CAM_PIN_VSYNC,
         .pin_href = CAM_PIN_HREF,
         .pin_pclk = CAM_PIN_PCLK,
-        .xclk_freq_hz = 20000000,
+        .xclk_freq_hz = 10000000,
         .ledc_timer = LEDC_TIMER_0,
         .ledc_channel = LEDC_CHANNEL_0,
         .pixel_format = PIXFORMAT_JPEG,
         .frame_size = FRAMESIZE_QVGA,
-        .jpeg_quality = 12,
-        .fb_count = 2,
+        .jpeg_quality = 10,
+        .fb_count = 1,
         .fb_location = CAMERA_FB_IN_PSRAM,
-        .grab_mode = CAMERA_GRAB_LATEST,
+        .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
     };
 
     esp_err_t err = esp_camera_init(&config);
@@ -646,6 +1042,14 @@ void app_main(void)
             ESP_LOGW(TAG, "推論初期化未完了: %s", esp_err_to_name(infer_init_err));
         } else {
             s_inference_status = INFERENCE_STATUS_OK;
+        }
+
+        if (s_camera_ready && infer_init_err == ESP_OK) {
+            esp_err_t task_err = start_inference_task();
+            if (task_err != ESP_OK) {
+                s_inference_status = INFERENCE_STATUS_FAULT;
+                ESP_LOGW(TAG, "推論タスク開始失敗: %s", esp_err_to_name(task_err));
+            }
         }
 
         ESP_ERROR_CHECK(start_http_server());

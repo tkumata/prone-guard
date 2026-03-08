@@ -1,29 +1,34 @@
-# 顔認識監視デバイス 仕様書
+# prone-like 監視デバイス 仕様書
 
 ## 1. 対象機能
 
 - ESP32-S3 上の HTTP 映像配信
-- ESP-DL による顔認識推論
-- 顔未認識時の障害遷移
+- ESP-DL による顔検知推論
+- 顔矩形の時系列からの `prone-like` 推定
 
 ## 2. 設定仕様
 
 1. 固定設定
-   - `WIFI_SSID`: 文字列、必須、空文字禁止
-   - `WIFI_PASSWORD`: 文字列、必須、8 文字以上を推奨
+   - `CONFIG_WIFI_SSID`: 文字列、必須、空文字禁止 (`menuconfig` 定義)
+   - `CONFIG_WIFI_PASSWORD`: 文字列、必須、8 文字以上 (`menuconfig` 定義)
 
 2. 既定値
    - `FRAME_WIDTH = 320`
    - `FRAME_HEIGHT = 240`
    - `FRAME_INTERVAL_MS = 500`
-   - `FACE_CONFIDENCE_TH = 0.50`
-   - `FACE_MISS_FAULT_SEC = 3`
+   - `FACE_CONFIDENCE_TH = 0.35`
+   - `PRONE_LIKE_MISSING_MS_TH = 2000`
+   - `PRONE_LIKE_LONG_MISSING_MS_TH = 5000`
+   - `PRONE_LIKE_PRE_DISAPPEAR_MOVE_TH = 24.0`
+   - `PRONE_LIKE_AREA_DROP_TH = 0.20`
+   - `PRONE_LIKE_SCORE_TH = 0.70`
    - `WIFI_RETRY_INTERVAL_SEC = 5`
 
 3. 境界値
    - `FRAME_INTERVAL_MS`: 200 〜 1000
-   - `FACE_CONFIDENCE_TH`: 0.50 〜 0.95
-   - `FACE_MISS_FAULT_SEC`: 1 〜 10
+   - `FACE_CONFIDENCE_TH`: 0.25 〜 0.95
+   - `PRONE_LIKE_MISSING_MS_TH`: 1000 〜 5000
+   - `PRONE_LIKE_LONG_MISSING_MS_TH`: 3000 〜 10000
 
 ## 3. HTTP 仕様
 
@@ -49,7 +54,9 @@
   "state": "MONITORING",
   "wifi": "connected",
   "camera": "ok",
-  "inference": "ok"
+  "inference": "ok",
+  "monitor_status": "unknown",
+  "pre_disappear_move_px": 0.0
 }
 ```
 
@@ -63,18 +70,21 @@
   - `is_face_detected` (`true` / `false`)
   - `confidence` (0.0 〜 1.0)
 - 判定:
-  - `confidence >= FACE_CONFIDENCE_TH` かつ `is_face_detected == true` を正常候補とする。
+  - `confidence >= FACE_CONFIDENCE_TH` かつ `is_face_detected == true` を顔検知成立とする。
+  - `missing_ms`、`pre_disappear_move_px`、`pre_disappear_area_drop` から `prone_like_score` を算出する。
 
 ## 5. 監視判定仕様
 
-1. 正常判定
-   - `confidence >= FACE_CONFIDENCE_TH` かつ `is_face_detected == true` を正常とみなす。
+1. `OK`
+   - `confidence >= FACE_CONFIDENCE_TH` かつ `is_face_detected == true`
 
-2. 障害成立
-   - 非正常状態が `FACE_MISS_FAULT_SEC` 秒継続で `FAULT_INFERENCE` に遷移する。
+2. `UNKNOWN`
+   - 顔未検知かつ `prone_like_score < PRONE_LIKE_SCORE_TH`
+   - 想定用途は短時間の見失い
 
-3. 障害解除
-   - 正常判定を再取得したフレームで `MONITORING` に戻す。
+3. `NG`
+   - 顔未検知かつ `prone_like_score >= PRONE_LIKE_SCORE_TH`
+   - `move_px` / `area_drop` が弱くても、長時間の顔消失で到達しうる
 
 ## 6. 描画仕様
 
@@ -90,8 +100,8 @@
 - `BOOT -> WIFI_CONNECTING`
 - `WIFI_CONNECTING -> READY`
 - `READY -> MONITORING`
-- `MONITORING -> FAULT_INFERENCE`
-- `FAULT_INFERENCE -> MONITORING`
+- `MONITORING -> ALERT`
+- `ALERT -> MONITORING`
 - `MONITORING/FAULT_INFERENCE -> FAULT_CAMERA`
 
 禁止遷移:
@@ -112,7 +122,7 @@
    - 影響: 画像配信停止
 
 3. 推論
-   - 条件: 顔が `FACE_MISS_FAULT_SEC` 秒以上認識できない
+   - 条件: モデル実行に失敗する
    - 挙動: `FAULT_INFERENCE` へ遷移
    - 影響: 映像配信は継続し、`/health` で障害状態を返す
 

@@ -10,6 +10,11 @@
 #include "human_face_detect.hpp"
 
 static const char *TAG = "prone_inference";
+static constexpr float DETECTOR_MSR_SCORE_TH = 0.30f;
+static constexpr float DETECTOR_MSR_NMS_TH = 0.45f;
+static constexpr float DETECTOR_MNP_SCORE_TH = 0.35f;
+static constexpr float DETECTOR_MNP_NMS_TH = 0.45f;
+static constexpr float FACE_DETECTED_SCORE_TH = 0.35f;
 
 static human_face_detect::MSRMNP *s_detector;
 static prone_inference_status_t s_status = PRONE_INFERENCE_STATUS_NOT_READY;
@@ -42,15 +47,20 @@ esp_err_t prone_inference_init(void)
         return ESP_ERR_NO_MEM;
     }
 
-    // 検出率重視で初期値はデフォルト運用。必要に応じて現地ログで再調整する。
-    s_detector->set_score_thr(0.50f, 0);
-    s_detector->set_nms_thr(0.50f, 0);
-    s_detector->set_score_thr(0.50f, 1);
-    s_detector->set_nms_thr(0.50f, 1);
+    // 内部候補は広めに拾い、最終判定は別閾値で制御する。
+    s_detector->set_score_thr(DETECTOR_MSR_SCORE_TH, 0);
+    s_detector->set_nms_thr(DETECTOR_MSR_NMS_TH, 0);
+    s_detector->set_score_thr(DETECTOR_MNP_SCORE_TH, 1);
+    s_detector->set_nms_thr(DETECTOR_MNP_NMS_TH, 1);
 
     s_status = PRONE_INFERENCE_STATUS_OK;
     ESP_LOGI(TAG,
-             "推論モデル読み込み完了 detector=MSRMNP files=[human_face_detect_msr_s8_v1.espdl,human_face_detect_mnp_s8_v1.espdl]");
+             "推論モデル読み込み完了 detector=MSRMNP files=[human_face_detect_msr_s8_v1.espdl,human_face_detect_mnp_s8_v1.espdl] th=[msr:%.2f/%.2f,mnp:%.2f/%.2f,final:%.2f]",
+             (double)DETECTOR_MSR_SCORE_TH,
+             (double)DETECTOR_MSR_NMS_TH,
+             (double)DETECTOR_MNP_SCORE_TH,
+             (double)DETECTOR_MNP_NMS_TH,
+             (double)FACE_DETECTED_SCORE_TH);
     return ESP_OK;
 }
 
@@ -94,7 +104,7 @@ esp_err_t prone_inference_run_jpeg(const uint8_t *jpeg_data, size_t jpeg_len, bo
     }
 
     *confidence = best;
-    *is_face_detected = (best >= 0.50f);
+    *is_face_detected = (best >= FACE_DETECTED_SCORE_TH);
     s_last_face_box.x0 = best_x0;
     s_last_face_box.y0 = best_y0;
     s_last_face_box.x1 = best_x1;

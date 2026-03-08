@@ -62,8 +62,8 @@
 ## 5. データ設計
 
 1. コンパイル時定数
-   - `WIFI_SSID`
-   - `WIFI_PASSWORD`
+   - `CONFIG_WIFI_SSID`
+   - `CONFIG_WIFI_PASSWORD`
    - `PRONE_CONFIDENCE_TH = 0.70f`
    - `PRONE_HOLD_SEC = 10`
    - `FRAME_INTERVAL_MS = 500`
