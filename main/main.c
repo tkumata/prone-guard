@@ -21,10 +21,14 @@
 #define WIFI_SSID "SSID"
 #define WIFI_PASSWORD "REMOVED"
 
+#define STRINGIFY_INNER(x) #x
+#define STRINGIFY(x) STRINGIFY_INNER(x)
+
 #define WIFI_RETRY_INTERVAL_MS 5000
 #define WIFI_CONNECTED_BIT BIT0
 #define INFERENCE_INTERVAL_MS 500
 #define STREAM_PACING_DELAY_MS 5
+#define UI_POLL_INTERVAL_MS 500
 #define INFERENCE_JPEG_MAX_BYTES (96 * 1024)
 #define FACE_CONFIDENCE_TH 0.45f
 #define FACE_DETECT_OK_STREAK_REQUIRED 3
@@ -269,6 +273,34 @@ static void set_system_state(system_state_t next_state)
     s_system_state = next_state;
 }
 
+static bool get_reportable_face_box(prone_face_box_t *box)
+{
+    if (box == NULL) {
+        return false;
+    }
+
+    *box = s_last_face_box;
+    bool detected = s_is_face_detected && box->valid;
+    if (!detected) {
+        return false;
+    }
+
+    if (box->x0 < 0) {
+        box->x0 = 0;
+    }
+    if (box->y0 < 0) {
+        box->y0 = 0;
+    }
+    if (box->x1 > 319) {
+        box->x1 = 319;
+    }
+    if (box->y1 > 239) {
+        box->y1 = 239;
+    }
+
+    return box->x1 > box->x0 && box->y1 > box->y0;
+}
+
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
     static const char html[] =
@@ -308,13 +340,12 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "};"
         "setInterval(async()=>{"
         "try{"
-        "const [boxResp,healthResp]=await Promise.all(["
-        "fetch('/face_box',{cache:'no-store'}),"
-        "fetch('/health',{cache:'no-store'})"
-        "]);"
-        "if(!boxResp.ok){box.style.display='none';}else{"
-        "const d=await boxResp.json();"
-        "if(!d.detected){box.style.display='none';}else{"
+        "const healthResp=await fetch('/health',{cache:'no-store'});"
+        "if(!healthResp.ok){box.style.display='none';updateStatus('unknown');}else{"
+        "const h=await healthResp.json();"
+        "updateStatus(typeof h.monitor_status==='string'?h.monitor_status:'unknown');"
+        "const d=h.face_box;"
+        "if(!d||!d.detected){box.style.display='none';}else{"
         "const x0=clamp(d.x0,0,319),y0=clamp(d.y0,0,239),x1=clamp(d.x1,0,319),y1=clamp(d.y1,0,239);"
         "if(x1<=x0||y1<=y0){box.style.display='none';}else{"
         "box.style.left=x0+'px';box.style.top=y0+'px';"
@@ -323,25 +354,25 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "}"
         "}"
         "}"
-        "if(!healthResp.ok){updateStatus('unknown');}else{"
-        "const h=await healthResp.json();"
-        "updateStatus(typeof h.monitor_status==='string'?h.monitor_status:'unknown');"
-        "}"
         "}catch(e){box.style.display='none';updateStatus('unknown');}"
-        "},200);"
+        "}," STRINGIFY(UI_POLL_INTERVAL_MS) ");"
         "</script>"
         "</body></html>";
 
     httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Connection", "close");
     return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t health_get_handler(httpd_req_t *req)
 {
-    char json[512];
+    char json[640];
     const char *wifi_status = s_wifi_connected ? "connected" : "disconnected";
     const char *camera_status = s_camera_ready ? "ok" : "fault";
     const char *inference_status = inference_status_to_string(s_inference_status);
+    prone_face_box_t box;
+    bool detected = get_reportable_face_box(&box);
 
     int written = snprintf(json,
                            sizeof(json),
@@ -349,7 +380,8 @@ static esp_err_t health_get_handler(httpd_req_t *req)
                            "\"face_detected\":%s,\"face_confidence\":%.3f,"
                            "\"face_raw_detected\":%s,\"face_detect_streak\":%d,\"face_detect_confirmed\":%s,"
                            "\"monitor_status\":\"%s\",\"prone_like\":%s,\"prone_like_score\":%.3f,"
-                           "\"face_missing_ms\":%d,\"pre_disappear_move_px\":%.1f,\"pre_disappear_area_drop\":%.3f}",
+                           "\"face_missing_ms\":%d,\"pre_disappear_move_px\":%.1f,\"pre_disappear_area_drop\":%.3f,"
+                           "\"face_box\":{\"detected\":%s,\"x0\":%d,\"y0\":%d,\"x1\":%d,\"y1\":%d,\"confidence\":%.3f}}",
                            state_to_string(s_system_state),
                            wifi_status,
                            camera_status,
@@ -364,37 +396,28 @@ static esp_err_t health_get_handler(httpd_req_t *req)
                            (double)s_prone_like_score,
                            s_face_missing_ms,
                            (double)s_pre_disappear_move_px,
-                           (double)s_pre_disappear_area_drop);
+                           (double)s_pre_disappear_area_drop,
+                           detected ? "true" : "false",
+                           detected ? box.x0 : -1,
+                           detected ? box.y0 : -1,
+                           detected ? box.x1 : -1,
+                           detected ? box.y1 : -1,
+                           (double)(detected ? box.confidence : 0.0f));
     if (written < 0 || written >= (int)sizeof(json)) {
         return ESP_FAIL;
     }
 
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Connection", "close");
     return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t face_box_get_handler(httpd_req_t *req)
 {
     char json[192];
-    prone_face_box_t box = s_last_face_box;
-    bool detected = s_is_face_detected && box.valid;
-    if (detected) {
-        if (box.x0 < 0) {
-            box.x0 = 0;
-        }
-        if (box.y0 < 0) {
-            box.y0 = 0;
-        }
-        if (box.x1 > 319) {
-            box.x1 = 319;
-        }
-        if (box.y1 > 239) {
-            box.y1 = 239;
-        }
-        if (box.x1 <= box.x0 || box.y1 <= box.y0) {
-            detected = false;
-        }
-    }
+    prone_face_box_t box;
+    bool detected = get_reportable_face_box(&box);
 
     int written = snprintf(json,
                            sizeof(json),
@@ -410,6 +433,8 @@ static esp_err_t face_box_get_handler(httpd_req_t *req)
     }
 
     httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Connection", "close");
     return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
 }
 
@@ -425,6 +450,7 @@ static esp_err_t stream_get_handler(httpd_req_t *req)
     static const char *stream_content_type = "multipart/x-mixed-replace;boundary=frame";
     static const char *stream_boundary = "\r\n--frame\r\n";
     char part_header[64];
+    esp_err_t stream_err = ESP_OK;
 
     httpd_resp_set_type(req, stream_content_type);
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
@@ -453,26 +479,27 @@ static esp_err_t stream_get_handler(httpd_req_t *req)
             return ESP_FAIL;
         }
 
-        esp_err_t err = httpd_resp_send_chunk(req, stream_boundary, strlen(stream_boundary));
-        if (err == ESP_OK) {
-            err = httpd_resp_send_chunk(req, part_header, hlen);
+        stream_err = httpd_resp_send_chunk(req, stream_boundary, strlen(stream_boundary));
+        if (stream_err == ESP_OK) {
+            stream_err = httpd_resp_send_chunk(req, part_header, hlen);
         }
-        if (err == ESP_OK) {
-            err = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+        if (stream_err == ESP_OK) {
+            stream_err = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
         }
-        if (err == ESP_OK) {
-            err = httpd_resp_send_chunk(req, "\r\n", 2);
+        if (stream_err == ESP_OK) {
+            stream_err = httpd_resp_send_chunk(req, "\r\n", 2);
         }
 
         esp_camera_fb_return(fb);
-        if (err != ESP_OK) {
+        if (stream_err != ESP_OK) {
             break;
         }
 
         vTaskDelay(pdMS_TO_TICKS(STREAM_PACING_DELAY_MS));
     }
 
-    return ESP_OK;
+    ESP_LOGI(TAG, "ストリーム接続終了: %s", esp_err_to_name(stream_err));
+    return stream_err;
 }
 
 static esp_err_t run_prone_inference(camera_fb_t *fb, bool *is_face_detected, float *confidence)
@@ -709,6 +736,7 @@ static esp_err_t start_http_server(void)
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
+    config.keep_alive_enable = false;
 
     esp_err_t err = httpd_start(&s_http_server, &config);
     if (err != ESP_OK) {
@@ -754,6 +782,7 @@ static esp_err_t start_stream_http_server(void)
     config.server_port = 81;
     config.ctrl_port = 32769;
     config.lru_purge_enable = true;
+    config.keep_alive_enable = false;
 
     esp_err_t err = httpd_start(&s_stream_http_server, &config);
     if (err != ESP_OK) {
