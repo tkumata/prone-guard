@@ -9,8 +9,8 @@
 ## 2. 設定仕様
 
 1. 固定設定
-   - `WIFI_SSID`: 文字列、必須、空文字禁止
-   - `WIFI_PASSWORD`: 文字列、必須、8 文字以上を推奨
+   - `CONFIG_WIFI_SSID`: 文字列、必須、空文字禁止 (`menuconfig` 定義)
+   - `CONFIG_WIFI_PASSWORD`: 文字列、必須、8 文字以上 (`menuconfig` 定義)
 
 2. 既定値
    - `FRAME_WIDTH = 320`

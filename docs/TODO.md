@@ -2,7 +2,7 @@
 
 ## 1. 優先度 高
 
-- [x] T-001 `main/main.c` に Wi-Fi STA 初期化を実装する。完了条件: 固定 SSID/PASSWORD で接続成功ログが出る。
+- [x] T-001 `main/main.c` に Wi-Fi STA 初期化を実装する。完了条件: 設定した SSID/PASSWORD で接続成功ログが出る。
 - [x] T-002 HTTP サーバを実装し `GET /` を返す。完了条件: ブラウザで HTML が表示される。
 - [x] T-003 `GET /stream` の MJPEG 配信を実装する。完了条件: 320x240 映像が連続更新される。
 - [x] T-004 ESP-DL 推論の最小呼び出しを実装する。完了条件: フレームごとに `is_face_detected` と `confidence` を取得できる。

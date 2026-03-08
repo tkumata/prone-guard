@@ -18,8 +18,18 @@
 #include "nvs_flash.h"
 #include "prone_inference_bridge.h"
 
-#define WIFI_SSID "Rakuten-EBBB"
-#define WIFI_PASSWORD "8X62VENBT2"
+#if !defined(CONFIG_WIFI_SSID) || !defined(CONFIG_WIFI_PASSWORD)
+#error "WiFi credentials must be configured via menuconfig (Prone Guard Configuration)"
+#endif
+
+// 空文字列チェック。sizeof("") は終端文字を含むため 1
+_Static_assert(sizeof(CONFIG_WIFI_SSID) > 1, "CONFIG_WIFI_SSID must not be empty");
+
+// 文字数チェック。WPA要件である8文字以上。sizeof("12345678") は 9
+_Static_assert(sizeof(CONFIG_WIFI_PASSWORD) >= 9, "CONFIG_WIFI_PASSWORD must be at least 8 characters long");
+
+#define WIFI_SSID CONFIG_WIFI_SSID
+#define WIFI_PASSWORD CONFIG_WIFI_PASSWORD
 
 #define STRINGIFY_INNER(x) #x
 #define STRINGIFY(x) STRINGIFY_INNER(x)
