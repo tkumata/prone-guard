@@ -51,6 +51,21 @@ _Static_assert(sizeof(CONFIG_WIFI_PASSWORD) >= 9, "CONFIG_WIFI_PASSWORD must be 
 #define PRONE_LIKE_SCORE_TH (0.70f)
 #define PRE_DISAPPEAR_SAMPLE_MAX_GAP_MS (1500)
 
+// ランドマーク方向メトリクスの閾値
+#define LANDMARK_MIN_DIST (3)
+#define YA_ROTATION_TH (0.30f)
+#define VP_DEVIATION_TH (0.12f)
+#define FR_FORESHORTEN_TH (0.40f)
+#define VP_FRONTAL_CENTER (0.40f)
+
+// prone_like_score の重み (合計 1.2 に緩める: 複数兆候があれば容易に 0.70 を超える)
+#define W_MISSING (0.35f)
+#define W_MOVE    (0.15f)
+#define W_AREA    (0.15f)
+#define W_YAW     (0.25f)
+#define W_VP      (0.15f)
+#define W_FR      (0.15f)
+
 // Freenove ESP32-S3 WROOM CAM (OV2640) 想定ピン定義
 #define CAM_PIN_PWDN -1
 #define CAM_PIN_RESET -1
@@ -95,11 +110,19 @@ typedef enum {
 } monitor_status_t;
 
 typedef struct {
+    float yaw_asym;   // ヨー非対称度 [0,1], -1 = 無効
+    float vert_prop;  // 縦比率 [0,1], -1 = 無効
+    float fore_ratio; // 短縮比 (0,+inf), -1 = 無効
+    bool valid;
+} face_orientation_t;
+
+typedef struct {
     int center_x;
     int center_y;
     int area;
     int64_t timestamp_ms;
     bool valid;
+    face_orientation_t orientation;
 } face_observation_t;
 
 static EventGroupHandle_t s_wifi_event_group;
@@ -127,6 +150,9 @@ static float s_prone_like_score;
 static int s_face_missing_ms;
 static float s_pre_disappear_move_px;
 static float s_pre_disappear_area_drop;
+static float s_pre_disappear_yaw_trend;
+static float s_pre_disappear_vp_trend;
+static float s_pre_disappear_fr_trend;
 static face_observation_t s_face_observation_history[FACE_OBSERVATION_HISTORY_SIZE];
 static size_t s_face_observation_count;
 static size_t s_face_observation_next_index;
@@ -142,6 +168,7 @@ static esp_err_t face_box_get_handler(httpd_req_t *req);
 static bool publish_frame_for_inference(camera_fb_t *fb);
 static void inference_task(void *arg);
 static esp_err_t start_inference_task(void);
+static face_orientation_t compute_face_orientation(const prone_face_box_t *box);
 
 static const char *state_to_string(system_state_t state)
 {
@@ -210,6 +237,67 @@ static inference_status_t from_bridge_status(prone_inference_status_t status)
     }
 }
 
+// ランドマーク座標から顔の方向メトリクスを算出する (O(1))
+static face_orientation_t compute_face_orientation(const prone_face_box_t *box)
+{
+    face_orientation_t orient = { .yaw_asym = -1.0f, .vert_prop = -1.0f, .fore_ratio = -1.0f, .valid = false };
+
+    if (box == NULL || !box->landmarks_valid) {
+        return orient;
+    }
+
+    // ランドマーク座標の取得
+    float lx = (float)box->landmarks[PRONE_LM_LEFT_EYE * 2];
+    float ly = (float)box->landmarks[PRONE_LM_LEFT_EYE * 2 + 1];
+    float rx = (float)box->landmarks[PRONE_LM_RIGHT_EYE * 2];
+    float ry = (float)box->landmarks[PRONE_LM_RIGHT_EYE * 2 + 1];
+    float nx = (float)box->landmarks[PRONE_LM_NOSE * 2];
+    float ny = (float)box->landmarks[PRONE_LM_NOSE * 2 + 1];
+    float lmx = (float)box->landmarks[PRONE_LM_LEFT_MOUTH * 2];
+    float lmy = (float)box->landmarks[PRONE_LM_LEFT_MOUTH * 2 + 1];
+    float rmx = (float)box->landmarks[PRONE_LM_RIGHT_MOUTH * 2];
+    float rmy = (float)box->landmarks[PRONE_LM_RIGHT_MOUTH * 2 + 1];
+
+    // 今後の拡張（口角の傾きによる回転推定など）で使用するため予約
+    (void)lmx;
+    (void)rmx;
+
+    // 1. ヨー非対称度 (YA): 鼻から左目/右目までの距離比
+    float d_left = sqrtf((nx - lx) * (nx - lx) + (ny - ly) * (ny - ly));
+    float d_right = sqrtf((rx - nx) * (rx - nx) + (ry - ny) * (ry - ny));
+    float d_max = (d_left > d_right) ? d_left : d_right;
+    if (d_max >= (float)LANDMARK_MIN_DIST) {
+        float d_diff = (d_left > d_right) ? (d_left - d_right) : (d_right - d_left);
+        orient.yaw_asym = d_diff / d_max;
+    }
+
+    // 2. 縦比率 (VP): 鼻が目と口の間のどこにあるか
+    float eye_mid_y = (ly + ry) / 2.0f;
+    float mouth_mid_y = (lmy + rmy) / 2.0f;
+    float upper = ny - eye_mid_y;
+    float lower = mouth_mid_y - ny;
+    float total_height = upper + lower;
+    if (total_height >= (float)LANDMARK_MIN_DIST) {
+        orient.vert_prop = upper / total_height;
+    } else {
+        orient.vert_prop = 0.5f; // 縮退ケース: 不定
+    }
+
+    // 3. 短縮比 (FR): 目の間隔と顔の縦幅の比率
+    float inter_eye = sqrtf((rx - lx) * (rx - lx) + (ry - ly) * (ry - ly));
+    float face_height = mouth_mid_y - eye_mid_y;
+    if (face_height >= (float)LANDMARK_MIN_DIST) {
+        orient.fore_ratio = inter_eye / face_height;
+    } else if (face_height > 0.0f) {
+        orient.fore_ratio = 2.0f; // 前傾扱い
+    } else {
+        orient.fore_ratio = 2.0f; // 前傾扱い
+    }
+
+    orient.valid = (orient.yaw_asym >= 0.0f);
+    return orient;
+}
+
 static void update_face_observation(const prone_face_box_t *box, int64_t now_ms)
 {
     if (box == NULL || !box->valid) {
@@ -228,6 +316,7 @@ static void update_face_observation(const prone_face_box_t *box, int64_t now_ms)
     observation->area = width * height;
     observation->timestamp_ms = now_ms;
     observation->valid = true;
+    observation->orientation = compute_face_orientation(box);
 
     s_face_observation_next_index = (s_face_observation_next_index + 1) % FACE_OBSERVATION_HISTORY_SIZE;
     if (s_face_observation_count < FACE_OBSERVATION_HISTORY_SIZE) {
@@ -239,6 +328,9 @@ static void capture_pre_disappear_metrics(void)
 {
     s_pre_disappear_move_px = 0.0f;
     s_pre_disappear_area_drop = 0.0f;
+    s_pre_disappear_yaw_trend = 0.0f;
+    s_pre_disappear_vp_trend = 0.0f;
+    s_pre_disappear_fr_trend = 0.0f;
 
     if (s_face_observation_count < 2) {
         return;
@@ -252,15 +344,18 @@ static void capture_pre_disappear_metrics(void)
     }
 
     int max_area = latest.area;
+    // ランドマーク回転傾向算出用: 有効なサンプル中で最も古い観測を取得
+    face_observation_t *oldest_valid = NULL;
+
     for (size_t offset = 1; offset < s_face_observation_count; ++offset) {
         size_t index =
             (s_face_observation_next_index + FACE_OBSERVATION_HISTORY_SIZE - 1 - offset) % FACE_OBSERVATION_HISTORY_SIZE;
-        face_observation_t observation = s_face_observation_history[index];
-        if (!observation.valid) {
+        face_observation_t *observation = &s_face_observation_history[index];
+        if (!observation->valid) {
             continue;
         }
 
-        int64_t gap_ms = latest.timestamp_ms - observation.timestamp_ms;
+        int64_t gap_ms = latest.timestamp_ms - observation->timestamp_ms;
         if (gap_ms <= 0) {
             continue;
         }
@@ -268,39 +363,80 @@ static void capture_pre_disappear_metrics(void)
             break;
         }
 
-        int dx = latest.center_x - observation.center_x;
-        int dy = latest.center_y - observation.center_y;
+        int dx = latest.center_x - observation->center_x;
+        int dy = latest.center_y - observation->center_y;
         float move_px = sqrtf((float)(dx * dx + dy * dy));
         if (move_px > s_pre_disappear_move_px) {
             s_pre_disappear_move_px = move_px;
         }
 
-        if (observation.area > max_area) {
-            max_area = observation.area;
+        if (observation->area > max_area) {
+            max_area = observation->area;
+        }
+
+        // 最も古い有効観測を記録
+        if (observation->orientation.valid) {
+            oldest_valid = observation;
         }
     }
 
     if (max_area > 0 && latest.area < max_area) {
         s_pre_disappear_area_drop = ((float)(max_area - latest.area)) / (float)max_area;
     }
+
+    // ランドマーク回転傾向: 直近 - 最古
+    if (oldest_valid != NULL && latest.orientation.valid && oldest_valid->orientation.valid) {
+        if (latest.orientation.yaw_asym >= 0.0f && oldest_valid->orientation.yaw_asym >= 0.0f) {
+            s_pre_disappear_yaw_trend = latest.orientation.yaw_asym - oldest_valid->orientation.yaw_asym;
+        }
+        if (latest.orientation.vert_prop >= 0.0f && oldest_valid->orientation.vert_prop >= 0.0f) {
+            s_pre_disappear_vp_trend = latest.orientation.vert_prop - oldest_valid->orientation.vert_prop;
+        }
+        if (latest.orientation.fore_ratio >= 0.0f && oldest_valid->orientation.fore_ratio >= 0.0f) {
+            s_pre_disappear_fr_trend = latest.orientation.fore_ratio - oldest_valid->orientation.fore_ratio;
+        }
+    }
+}
+
+// [0,1] にクランプするヘルパー
+static inline float clamp01(float x)
+{
+    if (x < 0.0f) return 0.0f;
+    if (x > 1.0f) return 1.0f;
+    return x;
 }
 
 static float compute_prone_like_score(int missing_ms, float pre_disappear_move_px, float pre_disappear_area_drop)
 {
-    float score = 0.0f;
+    // 消失時間: 線形補間 [T_min, T_max] -> [0, 1]
+    float f_missing = clamp01(
+        ((float)missing_ms - (float)PRONE_LIKE_MISSING_MS_TH)
+        / ((float)PRONE_LIKE_LONG_MISSING_MS_TH - (float)PRONE_LIKE_MISSING_MS_TH));
 
-    if (missing_ms >= PRONE_LIKE_MISSING_MS_TH) {
-        score += 0.55f;
-    }
-    if (missing_ms >= PRONE_LIKE_LONG_MISSING_MS_TH) {
-        score += 0.20f;
-    }
-    if (pre_disappear_move_px >= PRONE_LIKE_PRE_DISAPPEAR_MOVE_TH) {
-        score += 0.25f;
-    }
-    if (pre_disappear_area_drop >= PRONE_LIKE_AREA_DROP_TH) {
-        score += 0.20f;
-    }
+    // 消失前の移動量
+    float f_move = clamp01(pre_disappear_move_px / PRONE_LIKE_PRE_DISAPPEAR_MOVE_TH);
+
+    // 消失前の面積縮小率
+    float f_area = clamp01(pre_disappear_area_drop / PRONE_LIKE_AREA_DROP_TH);
+
+    // ランドマーク回転傾向（ヨー変化 = 左右どちらかを向いた。絶対値をとる）
+    float abs_yaw = s_pre_disappear_yaw_trend < 0 ? -s_pre_disappear_yaw_trend : s_pre_disappear_yaw_trend;
+    float f_yaw = clamp01(abs_yaw / YA_ROTATION_TH);
+
+    // ランドマーク回転傾向（VP 偏差 = うつ伏せ方向または仰向け方向への大きな変化。絶対値をとる）
+    float abs_vp = s_pre_disappear_vp_trend < 0 ? -s_pre_disappear_vp_trend : s_pre_disappear_vp_trend;
+    float f_vp = clamp01(abs_vp / VP_DEVIATION_TH);
+
+    // ランドマーク回転傾向（FR 変化 = 前後への倒れ込み。絶対値をとる）
+    float abs_fr = s_pre_disappear_fr_trend < 0 ? -s_pre_disappear_fr_trend : s_pre_disappear_fr_trend;
+    float f_fr = clamp01(abs_fr / FR_FORESHORTEN_TH);
+
+    float score = W_MISSING * f_missing
+               + W_MOVE * f_move
+               + W_AREA * f_area
+               + W_YAW * f_yaw
+               + W_VP * f_vp
+               + W_FR * f_fr;
 
     return score;
 }
@@ -409,12 +545,13 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 
 static esp_err_t health_get_handler(httpd_req_t *req)
 {
-    char json[640];
+    char json[1024];
     const char *wifi_status = s_wifi_connected ? "connected" : "disconnected";
     const char *camera_status = s_camera_ready ? "ok" : "fault";
     const char *inference_status = inference_status_to_string(s_inference_status);
     prone_face_box_t box;
     bool detected = get_reportable_face_box(&box);
+    face_orientation_t orient = compute_face_orientation(&box);
 
     int written = snprintf(json,
                            sizeof(json),
@@ -423,6 +560,8 @@ static esp_err_t health_get_handler(httpd_req_t *req)
                            "\"face_raw_detected\":%s,\"face_detect_streak\":%d,\"face_detect_confirmed\":%s,"
                            "\"monitor_status\":\"%s\",\"prone_like\":%s,\"prone_like_score\":%.3f,"
                            "\"face_missing_ms\":%d,\"pre_disappear_move_px\":%.1f,\"pre_disappear_area_drop\":%.3f,"
+                           "\"pre_disappear_yaw_trend\":%.3f,\"pre_disappear_vp_trend\":%.3f,\"pre_disappear_fr_trend\":%.3f,"
+                           "\"orientation\":{\"yaw_asym\":%.3f,\"vert_prop\":%.3f,\"fore_ratio\":%.3f,\"valid\":%s},"
                            "\"face_box\":{\"detected\":%s,\"x0\":%d,\"y0\":%d,\"x1\":%d,\"y1\":%d,\"confidence\":%.3f}}",
                            state_to_string(s_system_state),
                            wifi_status,
@@ -439,6 +578,13 @@ static esp_err_t health_get_handler(httpd_req_t *req)
                            s_face_missing_ms,
                            (double)s_pre_disappear_move_px,
                            (double)s_pre_disappear_area_drop,
+                           (double)s_pre_disappear_yaw_trend,
+                           (double)s_pre_disappear_vp_trend,
+                           (double)s_pre_disappear_fr_trend,
+                           (double)(orient.valid ? orient.yaw_asym : -1.0f),
+                           (double)(orient.valid ? orient.vert_prop : -1.0f),
+                           (double)(orient.valid ? orient.fore_ratio : -1.0f),
+                           orient.valid ? "true" : "false",
                            detected ? "true" : "false",
                            detected ? box.x0 : -1,
                            detected ? box.y0 : -1,
@@ -708,6 +854,9 @@ static void update_face_monitor(bool is_face_detected, float confidence)
         s_face_missing_ms = 0;
         s_pre_disappear_move_px = 0.0f;
         s_pre_disappear_area_drop = 0.0f;
+        s_pre_disappear_yaw_trend = 0.0f;
+        s_pre_disappear_vp_trend = 0.0f;
+        s_pre_disappear_fr_trend = 0.0f;
         if (s_system_state != SYSTEM_STATE_FAULT_CAMERA) {
             set_system_state(SYSTEM_STATE_FAULT_INFERENCE);
         }
@@ -724,6 +873,9 @@ static void update_face_monitor(bool is_face_detected, float confidence)
         s_prone_like_detected = false;
         s_pre_disappear_move_px = 0.0f;
         s_pre_disappear_area_drop = 0.0f;
+        s_pre_disappear_yaw_trend = 0.0f;
+        s_pre_disappear_vp_trend = 0.0f;
+        s_pre_disappear_fr_trend = 0.0f;
         s_monitor_status = MONITOR_STATUS_OK;
     } else {
         if (s_face_missing_started_ms < 0) {
@@ -748,7 +900,7 @@ static void update_face_monitor(bool is_face_detected, float confidence)
     if (now_ms - s_last_face_log_ms >= 1000) {
         s_last_face_log_ms = now_ms;
         ESP_LOGI(TAG,
-                 "monitor: face=%d confidence=%.3f raw_ok=%d streak=%d confirmed=%d missing_ms=%d move_px=%.1f area_drop=%.3f prone_score=%.2f prone_like=%d label=%s state=%s",
+                 "monitor: face=%d confidence=%.3f raw_ok=%d streak=%d confirmed=%d missing_ms=%d move_px=%.1f area_drop=%.3f yaw_trend=%.3f vp_trend=%.3f fr_trend=%.3f prone_score=%.2f prone_like=%d label=%s state=%s",
                  s_is_face_detected ? 1 : 0,
                  (double)s_face_confidence,
                  raw_face_ok ? 1 : 0,
@@ -757,6 +909,9 @@ static void update_face_monitor(bool is_face_detected, float confidence)
                  s_face_missing_ms,
                  (double)s_pre_disappear_move_px,
                  (double)s_pre_disappear_area_drop,
+                 (double)s_pre_disappear_yaw_trend,
+                 (double)s_pre_disappear_vp_trend,
+                 (double)s_pre_disappear_fr_trend,
                  (double)s_prone_like_score,
                  s_prone_like_detected ? 1 : 0,
                  monitor_status_to_string(s_monitor_status),

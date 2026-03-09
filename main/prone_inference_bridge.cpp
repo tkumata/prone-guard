@@ -26,6 +26,8 @@ static prone_face_box_t s_last_face_box = {
     .y1 = -1,
     .confidence = 0.0f,
     .valid = false,
+    .landmarks = {0},
+    .landmarks_valid = false,
 };
 
 esp_err_t prone_inference_init(void)
@@ -91,6 +93,7 @@ esp_err_t prone_inference_run_jpeg(const uint8_t *jpeg_data, size_t jpeg_len, bo
     int best_y0 = -1;
     int best_x1 = -1;
     int best_y1 = -1;
+    std::vector<int> best_keypoint;
     for (const auto &r : result) {
         if (r.score > best) {
             best = r.score;
@@ -100,6 +103,7 @@ esp_err_t prone_inference_run_jpeg(const uint8_t *jpeg_data, size_t jpeg_len, bo
                 best_x1 = r.box[2];
                 best_y1 = r.box[3];
             }
+            best_keypoint = r.keypoint;
         }
     }
 
@@ -112,6 +116,17 @@ esp_err_t prone_inference_run_jpeg(const uint8_t *jpeg_data, size_t jpeg_len, bo
     s_last_face_box.confidence = best;
     s_last_face_box.valid = (*is_face_detected) && (best_x0 >= 0) && (best_y0 >= 0) &&
                             (best_x1 > best_x0) && (best_y1 > best_y0);
+
+    // ランドマーク座標を抽出 (5点 x 2座標 = 10要素)
+    if (best_keypoint.size() >= PRONE_LANDMARK_COUNT * 2) {
+        for (int i = 0; i < PRONE_LANDMARK_COUNT * 2; i++) {
+            s_last_face_box.landmarks[i] = best_keypoint[i];
+        }
+        s_last_face_box.landmarks_valid = s_last_face_box.valid;
+    } else {
+        memset(s_last_face_box.landmarks, 0, sizeof(s_last_face_box.landmarks));
+        s_last_face_box.landmarks_valid = false;
+    }
 
     int64_t now_ms = esp_timer_get_time() / 1000;
     if (now_ms - s_last_decode_log_ms >= 1000) {
