@@ -22,6 +22,16 @@
    - `PRONE_LIKE_PRE_DISAPPEAR_MOVE_TH = 24.0`
    - `PRONE_LIKE_AREA_DROP_TH = 0.20`
    - `PRONE_LIKE_SCORE_TH = 0.70`
+   - `LANDMARK_MIN_DIST = 3`
+   - `YA_ROTATION_TH = 0.30`
+   - `VP_DEVIATION_TH = 0.12`
+   - `FR_FORESHORTEN_TH = 0.40`
+   - `W_MISSING = 0.35`
+   - `W_MOVE = 0.15`
+   - `W_AREA = 0.15`
+   - `W_YAW = 0.25`
+   - `W_VP = 0.15`
+   - `W_FR = 0.15`
    - `WIFI_RETRY_INTERVAL_SEC = 5`
 
 3. 境界値
@@ -69,9 +79,30 @@
 - 出力:
   - `is_face_detected` (`true` / `false`)
   - `confidence` (0.0 〜 1.0)
+  - `landmarks` (5点ランドマーク: 左目・右目・鼻・左口角・右口角、各 x,y 座標)
 - 判定:
   - `confidence >= FACE_CONFIDENCE_TH` かつ `is_face_detected == true` を顔検知成立とする。
-  - `missing_ms`、`pre_disappear_move_px`、`pre_disappear_area_drop` から `prone_like_score` を算出する。
+  - ランドマーク座標から方向メトリクスを算出する。
+  - `missing_ms`、`pre_disappear_move_px`、`pre_disappear_area_drop`、ランドマーク回転傾向 から `prone_like_score` を算出する。
+
+## 4.1 方向メトリクス仕様
+
+- ヨー非対称度 (YA): 鼻から左目/右目までのユークリッド距離比。範囲 [0,1]。
+- 縦比率 (VP): 目〜鼻 / 目〜口 の縦位置比。範囲 [0,1]。正面顔で約 0.35〜0.45。
+- 短縮比 (FR): 目の間隔 / 目〜口の縦幅。正面顔で約 0.8〜1.2。
+- ランドマーク間距離が `LANDMARK_MIN_DIST` 未満の場合、当該メトリクスは無効値とする。
+
+## 4.2 prone_like_score 算出仕様
+
+- 6成分の重み付き線形結合 (重み合計 1.2):
+  - `f_missing`: 消失時間の線形補間 [T_min, T_max] -> [0, 1]
+  - `f_move`: 消失前移動量 / `PRONE_LIKE_PRE_DISAPPEAR_MOVE_TH`
+  - `f_area`: 消失前面積縮小率 / `PRONE_LIKE_AREA_DROP_TH`
+  - `f_yaw`: 消失前ヨー変化量（絶対値） / `YA_ROTATION_TH`
+  - `f_vp`: 消失前縦比率変化量（絶対値） / `VP_DEVIATION_TH`
+  - `f_fr`: 消失前短縮比変化量（絶対値） / `FR_FORESHORTEN_TH`
+- 各成分は [0, 1] にクランプ後、対応する重みを乗じて合算する。
+- ランドマークが無効な場合、回転由来の成分 (f_yaw, f_vp, f_fr) は 0 にフォールバックする。
 
 ## 5. 監視判定仕様
 

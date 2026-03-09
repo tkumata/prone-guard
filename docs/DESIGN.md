@@ -15,10 +15,10 @@
    - `camera_capture`: カメラ初期化と JPEG フレーム取得を担当する。
 
 3. 推論層
-   - `prone_inference`: ESP-DL でフレーム推論し、検知候補の矩形と信頼度を返す。
+   - `prone_inference`: ESP-DL でフレーム推論し、検知候補の矩形・信頼度・ランドマーク座標を返す。
 
 4. 判定層
-   - `prone_judge`: 連続時間判定を行い、`MONITORING` と `ALERT` を決定する。
+   - `prone_judge`: ランドマーク方向メトリクス（ヨー非対称度・縦比率・短縮比）と時系列判定を行い、`MONITORING` と `ALERT` を決定する。
 
 5. 描画層
    - `overlay_renderer`: 顔検知成立時に赤い四角を JPEG へ描画する。
@@ -72,6 +72,7 @@
    - `detection_box_t`: `x`, `y`, `w`, `h`, `confidence`
    - `inference_result_t`: `is_prone`, `confidence`, `box`, `timestamp_ms`
    - `system_state_t`: 現在状態、連続検知開始時刻、失敗カウンタ
+   - `face_orientation_t`: ランドマークから算出した方向メトリクス。※ランドマーク座標のうち左口角X (`lmx`) と右口角X (`rmx`) は現時点で使用していないが、今後の拡張（口角の傾きによる回転推定など）のために取得・予約している。
 
 ## 6. 処理フロー
 
