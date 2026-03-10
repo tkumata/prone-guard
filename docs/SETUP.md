@@ -1,10 +1,10 @@
-# VS Code + ESP-IDF + ESP-DL 環境構築手順（Freenove ESP32-S3 WROOM CAM）
+# VS Code + ESP-IDF + ESP-DL 環境構築手順 (Freenove ESP32-S3 WROOM CAM)
 
 ## 1. 事前準備
 
-- 対応OS: macOS / Linux / Windows
+- 対応OS: macOS / Linux
 - 推奨空き容量: 15GB 以上
-- USB データ通信対応ケーブルを使用する（充電専用ケーブル不可）
+- USB データ通信対応ケーブルを使用する (充電専用ケーブル不可)
 - ボード: Freenove ESP32-S3 WROOM CAM
 
 ## 2. 必要ソフトウェア
@@ -12,24 +12,28 @@
 1. VS Code
    - 公式配布版を導入する
 
-2. ESP-IDF 拡張
+2. ESP-IDF 拡張の導入
    - VS Code 拡張 `Espressif IDF` を導入する
 
-3. Python
+3. ESP-IDF の導入
+   - `brew tap espressif/eim`
+   - `brew install --cask eim-gui`
+
+4. Python
    - ESP-IDF が要求する Python バージョンを使用する
 
-4. CMake / Ninja / Git
+5. CMake / Ninja / Git
    - ESP-IDF セットアップ時に不足がある場合は追加導入する
 
 ## 3. VS Code 初期セットアップ
 
 1. コマンドパレットを開く
-   - `Cmd + Shift + P`（macOS） / `Ctrl + Shift + P`（Windows/Linux）
+   - `Cmd + Shift + P` (macOS) / `Ctrl + Shift + P` (Windows/Linux)
 
 2. `ESP-IDF: Open ESP-IDF Installation Manager` を実行
    - 拡張の導入後、インストーラを起動して ESP-IDF とツール群を導入する
    - 画面や拡張バージョンにより `ESP-IDF: Open ESP-IDF Install Manager` と表示される場合がある
-   - 一般的な配置先はホームディレクトリ配下（例: `~/.espressif`）
+   - 一般的な配置先はホームディレクトリ配下 (例: `~/.espressif`)
    - 既定導入では保存先入力が出ず、自動配置される場合がある
 
 3. 使用する ESP-IDF セットアップを選択
@@ -46,6 +50,13 @@
    - `idf.py` が実行できれば基本導入は完了
    - 通常の zsh で `idf.py` が見つからない場合でも、ESP-IDF Terminal で実行できれば導入は正常
    - 例: `$HOME/.espressif/v5.5.3/esp-idf/export.sh` が存在する環境では、ESP-IDF 本体は `~/.espressif` 配下にある
+
+VS Code 拡張ではなく、ターミナルで実行する場合:
+
+```shell
+source ~/.espressif/v5.5.3/esp-idf/export.sh
+idf.py --version
+```
 
 ## 4. 新規プロジェクト作成
 
@@ -92,7 +103,7 @@
    ls /dev/cu.*
    ```
 
-   - 接続前後で増えたデバイス名を確認する（例: `/dev/cu.usbmodemXXXX`）
+   - 接続前後で増えたデバイス名を確認する (例: `/dev/cu.usbmodemXXXX`)
    - macOS の場合: `/dev/cu.usbmodem5AB90112901` で認識されるはず
 
 3. 書き込み確認
@@ -124,7 +135,7 @@
    - Python 仮想環境の有効化状態
    - `managed_components` 配下の取得状態
 
-## 7. PSRAM 有効化の具体手順（Freenove ESP32-S3 WROOM CAM）
+## 7. PSRAM 有効化の具体手順(Freenove ESP32-S3 WROOM CAM)
 
 1. `menuconfig` を開く
 
@@ -136,8 +147,8 @@
    - `Component config` -> `Hardware Settings` -> `SPI RAM config` を開く
    - `Support for external, SPI-connected RAM` を有効化する
    - `SPI RAM type` は `Auto` で開始する
-   - `SPI RAM mode` は `Octal` または `OPI` を選ぶ（`quad_psram` は選ばない）
-   - `SPI RAM speed` は最初に `40MHz` を選ぶ（安定後に `80MHz` を検証）
+   - `SPI RAM mode` は `Octal` または `OPI` を選ぶ (`quad_psram` は選ばない)
+   - `SPI RAM speed` は最初に `40MHz` を選ぶ (安定後に `80MHz` を検証)
 
 3. Flash サイズを実機に合わせる
    - `Serial flasher config` -> `Flash size` を `16MB` に設定する
@@ -157,14 +168,14 @@
 
 6. Flash サイズ不一致警告が消えたことを確認する
    - 次の警告が出ないことを確認する
-   - `Detected size(16384k) larger than the size in the binary image header(2048k)`
+   - `Detected size (16384k) larger than the size in the binary image header (2048k)`
 
 7. 失敗時の切り分け
    - `quad_psram: PSRAM chip is not connected, or wrong PSRAM line mode` が出た場合:
      - `SPI RAM mode` を `Octal/OPI` 側に変更する
    - 起動直後に `Failed to init external RAM!` で abort する場合:
      - いったん `Support for external, SPI-connected RAM` を無効化して復旧する
-     - 復旧後にモジュール型番（`ESP32-S3-WROOM-1-N16R8` など）を確認し、再設定する
+     - 復旧後にモジュール型番 (`ESP32-S3-WROOM-1-N16R8` など) を確認し、再設定する
    - `SPI Flash Size : 2MB` のままの場合:
      - `Serial flasher config` の `Flash size` を再確認し、再書き込みする
 
@@ -188,7 +199,7 @@
    - ケーブル交換、USB ハブ経由回避、ドライバ再確認を実施
 
 2. `idf.py` が見つからない
-   - ESP-IDF 拡張のセットアップ再実行、統合ターミナル再起動を実施
+   - `source ~/.espressif/v5.5.3/esp-idf/export.sh` を実施
 
 3. フラッシュ失敗
    - BOOT ボタン押下で書き込みモードに入れて再実行する
@@ -201,14 +212,3 @@
 - 使用した ESP-IDF バージョンを `README.md` または `docs` に固定記録する
 - `sdkconfig.defaults` を管理し、設定差分を抑制する
 - 依存コンポーネントのバージョンを明示固定する
-
-## 11. この構成を採用する理由（3段階）
-
-1. なぜ VS Code + ESP-IDF か
-   - 公式拡張でセットアップ、ビルド、書き込み、モニタを一元化でき、初期障害を減らせるため
-
-2. なぜ ESP-DL か
-   - ESP32-S3 上で軽量推論を実行でき、クラウド依存を減らして通知遅延と停止リスクを下げられるため
-
-3. なぜ Freenove ESP32-S3 WROOM CAM か
-   - カメラ・PSRAM・Wi-Fi を単体ボードで扱え、試作速度と配線信頼性を両立しやすいため
