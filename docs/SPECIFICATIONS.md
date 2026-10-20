@@ -5,6 +5,7 @@
 - ESP32-S3 上の HTTP 映像配信
 - ESP-DL による顔検知推論
 - 顔矩形の時系列からの `prone-like` 推定
+- Jev 1.14 の画像判定と Web 管理画面での設定
 
 ## 2. 設定仕様
 
@@ -13,8 +14,8 @@
    - `CONFIG_WIFI_PASSWORD`: 文字列、必須、8 文字以上 (`menuconfig` 定義)
 
 2. 既定値
-   - `FRAME_WIDTH = 320`
-   - `FRAME_HEIGHT = 240`
+   - 撮影サイズ: 640x480
+   - ローカル推論サイズ: 320x240
    - `FRAME_INTERVAL_MS = 500`
    - `FACE_CONFIDENCE_TH = 0.35`
    - `PRONE_LIKE_MISSING_MS_TH = 2000`
@@ -161,3 +162,67 @@
 
 - 既存外部 API は未公開のため互換性制約はない。
 - 将来 HTTPS 化や認証追加時は `/health` の JSON 契約維持を優先する。
+
+## 10. Jev モードと設定 (Issue #10)
+
+### 設定 API
+
+- `GET /settings` は `mode`、`threshold`、`key_configured` を返す。
+- `mode` は `local` または `jev` とする。
+- `threshold` は 0〜1 の有限数とし、初期値は 0.5 とする。
+- `POST /settings` は `Content-Type: application/json` を要求する。
+- 本文の上限は 2047 bytes とする。
+- 本文は `mode`、`threshold`、`api_key` をすべて含む。
+- `api_key` は空文字または 512 文字以下の ASCII 可視文字とする。
+- 空文字の場合は、保存済み API key を変更しない。
+- 保存成功時は、NVS に commit してから設定を即時反映する。
+- 判定方式、閾値、API key を再起動後も維持する。
+- 入力不正は HTTP 400、保存失敗は HTTP 500 とする。
+- API key 自体は取得応答とログへ出力しない。
+- NVS 初期化に失敗しても、資格情報を自動消去しない。
+
+### 画像と判定
+
+- 撮影はブラウザの接続状態から独立したタスクで実行する。
+- 最新 JPEG は 1 件だけ保持する。バッファ上限は 256KiB とする。
+- 配信と推論はそれぞれ画像をコピーし、処理中に共有ロックを保持しない。
+- ローカル推論は 320x240 に縮小し、既存の画素閾値を維持する。
+- Jev へは VGA の JPEG を multipart で送る。
+- API は `https://api.typesafe.ai/v1/systemone` とする。
+- モデルは `jev-1.14.0` に固定する。
+- HTTPS のサーバ証明書とホスト名を検証する。
+- プロジェクト内の自己署名 GTS Root R4 を `cert_pem` に指定する。
+- Jev 接続では `crt_bundle_attach` を指定しない。
+- SNTP の時刻同期前は `clock_not_ready` とし、画像を送らない。
+- 送信は 10 秒周期、通信タイムアウトは送信開始から 8 秒とする。
+- タイムアウト後の再送は行わず、次の周期の画像を送る。
+- 並行送信と遅延分のまとめ送りは行わない。
+- Choice で `prone`、`not_prone`、`unjudgeable` を分類する。
+- 質問は、顔の向きではなく胴体と支持面の関係を対象にする。
+- `unjudgeable` は判別不能エラーとし、非うつ伏せへ変換しない。
+- 判別可能な場合は、`probabilities.prone >= threshold` を `true` とする。
+- `true` は `NG`、`false` は `OK`、エラーは `UNKNOWN` とする。
+- 設定変更前に開始した処理の結果は適用しない。
+- API のリダイレクトと認証の自動再試行は行わない。
+- 応答本文の上限は 8192 bytes とする。
+- 不正な JSON、型、選択肢、確率はエラーとする。
+
+### 状態取得
+
+`GET /health` に次の項目を追加する。
+
+| 項目 | 値 |
+| --- | --- |
+| `mode` | `local` または `jev` |
+| `jev_status` | `ok`、`pending`、`not_configured`、`network_error`、`timeout`、`http_error`、`invalid_response`、`unjudgeable`、`camera_error`、`clock_not_ready` |
+| `jev_probability` | 判定成功時はうつ伏せ確率、それ以外は -1 |
+| `jev_is_prone` | Jev 判定成功時は bool、それ以外は null |
+
+Jev モードでは顔検知の枠を表示しない。
+管理画面は Jev の `OK` を「うつ伏せ以外」と表示する。
+
+### 検証の限界
+
+- 自動テストは周期、応答検証、閾値、設定入力を確認する。
+- 実 API、実機の連続配信、NVS 復元、識別精度は別途検証する。
+- Jev の画像入力は実験機能であり、識別精度は未確認である。

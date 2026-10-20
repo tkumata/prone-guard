@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>prone-guard 監視</title>
+<style>
+body{font-family:sans-serif;margin:20px}#wrap{position:relative;width:320px;height:240px}#stream{width:320px;height:240px;display:block}#face-box{position:absolute;border:2px solid red;display:none;pointer-events:none;box-sizing:border-box}#status{font-size:20px;font-weight:bold}.ok{color:#0f766e}.ng{color:#b91c1c}.unknown{color:#a16207}label{display:block;margin:12px 0}input,select,button{font:inherit}#settings-status{white-space:pre-wrap}
+</style>
+</head>
+<body>
+<h1>prone-guard 監視</h1>
+<div id="wrap"><img id="stream" width="320" height="240" alt="カメラ映像"><div id="face-box"></div></div>
+<p id="status" class="unknown" role="status">UNKNOWN: 判定待ち</p>
+<p id="detail"></p>
+<form id="settings">
+<label>判定方式 <select id="mode" name="mode"><option value="local">prone-like (ローカル)</option><option value="jev">Jev 1.14</option></select></label>
+<label>Jev 判定閾値 <input id="threshold" name="threshold" type="number" min="0" max="1" step="any" value="0.5" required></label>
+<label>Jev API key <input id="api-key" name="api-key" type="password" maxlength="512" autocomplete="off" placeholder="空欄なら既存の key を維持"></label>
+<p id="key-status"></p>
+<p>Jev を選ぶと、ブラウザを閉じても画像を TypeSafe に送信します。API key の入力にはこの管理画面の HTTP 通信を使います。</p>
+<button id="save" type="submit" disabled>保存</button>
+<p id="settings-status" role="status"></p>
+</form>
+<p><a href="/health">状態 JSON</a> · <a href="/face_box">顔枠 JSON</a></p>
+<script>
+const image=document.getElementById('stream');
+const box=document.getElementById('face-box');
+const status=document.getElementById('status');
+const detail=document.getElementById('detail');
+const mode=document.getElementById('mode');
+const threshold=document.getElementById('threshold');
+const key=document.getElementById('api-key');
+const message=document.getElementById('settings-status');
+const save=document.getElementById('save');
+image.src='http://'+location.hostname+':81/stream';
+image.onerror=()=>{detail.textContent='映像の接続が切れました。再接続しています。';setTimeout(()=>{image.src='http://'+location.hostname+':81/stream?t='+Date.now();},2000);};
+function showSettings(settings){
+ mode.value=settings.mode;threshold.value=settings.threshold;
+ document.getElementById('key-status').textContent=settings.key_configured?'API key: 設定済み':'API key: 未設定';
+}
+(async()=>{
+ try{const response=await fetch('/settings',{cache:'no-store'});if(!response.ok)throw Error();showSettings(await response.json());save.disabled=false;}
+ catch{message.textContent='設定を取得できません。ページを再読み込みしてください。';}
+})();
+document.getElementById('settings').addEventListener('submit',async event=>{
+ event.preventDefault();save.disabled=true;message.textContent='保存中…';
+ try{
+  const response=await fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:mode.value,threshold:Number(threshold.value),api_key:key.value})});
+  if(!response.ok)throw Error('設定を保存できませんでした ('+response.status+')');
+  showSettings(await response.json());key.value='';message.textContent='保存しました。再起動後も設定を維持します。';
+ }catch(error){message.textContent=error.message;}
+ finally{save.disabled=false;}
+});
+const errors={pending:'判定待ち',not_configured:'API key が未設定です',network_error:'通信エラー',timeout:'8秒でタイムアウトしました',http_error:'API がエラーを返しました',invalid_response:'API 応答が不正です',unjudgeable:'画像から姿勢を判別できません',camera_error:'カメラ画像を取得できません',clock_not_ready:'時刻の同期を待っています'};
+const clamp=(v,min,max)=>Math.min(max,Math.max(min,v));
+async function poll(){
+ try{
+  const response=await fetch('/health',{cache:'no-store'});if(!response.ok)throw Error();
+  const health=await response.json();const jev=health.mode==='jev';
+  status.className=health.monitor_status==='ok'?'ok':health.monitor_status==='ng'?'ng':'unknown';
+  if(jev){
+   status.textContent=health.monitor_status==='ng'?'NG: うつ伏せ':health.monitor_status==='ok'?'OK: うつ伏せ以外':'UNKNOWN: '+(errors[health.jev_status]||'判定エラー');
+   detail.textContent=health.jev_status==='ok'?'Jev 1.14 / うつ伏せ確率: '+health.jev_probability.toFixed(3):'Jev 1.14 / '+(errors[health.jev_status]||'判定エラー');
+  }else{
+   status.textContent=health.monitor_status==='ok'?'OK: 顔検出':health.monitor_status==='ng'?'NG: prone-like':'UNKNOWN: 顔未検出';
+   detail.textContent='prone-like / 推論: '+health.inference;
+  }
+  const face=health.face_box;
+  box.style.display='none';
+  if(!jev&&face&&face.detected){
+   const x0=clamp(face.x0,0,319),y0=clamp(face.y0,0,239),x1=clamp(face.x1,0,319),y1=clamp(face.y1,0,239);
+   if(x1>x0&&y1>y0){Object.assign(box.style,{left:x0+'px',top:y0+'px',width:(x1-x0)+'px',height:(y1-y0)+'px',display:'block'});}
+  }
+ }catch{box.style.display='none';status.className='unknown';status.textContent='UNKNOWN: 状態を取得できません';}
+ finally{setTimeout(poll,500);}
+}
+poll();
+</script>
+</body>
+</html>

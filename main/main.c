@@ -3,6 +3,8 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <time.h>
 
 #include "esp_event.h"
 #include "esp_heap_caps.h"
@@ -17,6 +19,9 @@
 #include "freertos/semphr.h"
 #include "nvs_flash.h"
 #include "prone_inference_bridge.h"
+#include "monitor_settings.h"
+#include "jev_client.h"
+#include "esp_sntp.h"
 
 #if !defined(CONFIG_WIFI_SSID) || !defined(CONFIG_WIFI_PASSWORD)
 #error "WiFi credentials must be configured via menuconfig (Prone Guard Configuration)"
@@ -39,7 +44,7 @@ _Static_assert(sizeof(CONFIG_WIFI_PASSWORD) >= 9, "CONFIG_WIFI_PASSWORD must be 
 #define INFERENCE_INTERVAL_MS 500
 #define STREAM_PACING_DELAY_MS 5
 #define UI_POLL_INTERVAL_MS 500
-#define INFERENCE_JPEG_MAX_BYTES (96 * 1024)
+#define INFERENCE_JPEG_MAX_BYTES (256 * 1024)
 #define FACE_OBSERVATION_HISTORY_SIZE 6
 #define FACE_CONFIDENCE_TH 0.35f
 #define FACE_DETECT_OK_STREAK_REQUIRED 3
@@ -141,7 +146,6 @@ static int s_face_detect_streak;
 static float s_face_confidence;
 static int64_t s_last_face_detected_ms = -1;
 static int64_t s_face_missing_started_ms = -1;
-static int64_t s_last_inference_ms;
 static int64_t s_last_face_log_ms;
 static prone_face_box_t s_last_face_box;
 static monitor_status_t s_monitor_status = MONITOR_STATUS_UNKNOWN;
@@ -159,13 +163,16 @@ static size_t s_face_observation_next_index;
 static SemaphoreHandle_t s_inference_frame_mutex;
 static uint8_t *s_inference_frame_buf;
 static size_t s_inference_frame_len;
-static bool s_inference_frame_pending;
+static uint32_t s_frame_sequence;
+static SemaphoreHandle_t s_state_mutex;
+static monitor_settings_t s_settings;
+static uint32_t s_settings_generation;
+static jev_result_t s_jev_result = {.status = JEV_PENDING};
 static TaskHandle_t s_inference_task_handle;
 
-static esp_err_t run_prone_inference(camera_fb_t *fb, bool *is_face_detected, float *confidence);
 static void update_face_monitor(bool is_face_detected, float confidence);
 static esp_err_t face_box_get_handler(httpd_req_t *req);
-static bool publish_frame_for_inference(camera_fb_t *fb);
+static void capture_task(void *arg);
 static void inference_task(void *arg);
 static esp_err_t start_inference_task(void);
 static face_orientation_t compute_face_orientation(const prone_face_box_t *box);
@@ -218,22 +225,6 @@ static const char *monitor_status_to_string(monitor_status_t status)
     case MONITOR_STATUS_UNKNOWN:
     default:
         return "unknown";
-    }
-}
-
-static inference_status_t from_bridge_status(prone_inference_status_t status)
-{
-    switch (status) {
-    case PRONE_INFERENCE_STATUS_NOT_READY:
-        return INFERENCE_STATUS_NOT_READY;
-    case PRONE_INFERENCE_STATUS_OK:
-        return INFERENCE_STATUS_OK;
-    case PRONE_INFERENCE_STATUS_MODEL_MISSING:
-        return INFERENCE_STATUS_MODEL_MISSING;
-    case PRONE_INFERENCE_STATUS_FAULT:
-        return INFERENCE_STATUS_FAULT;
-    default:
-        return INFERENCE_STATUS_FAULT;
     }
 }
 
@@ -481,71 +472,18 @@ static bool get_reportable_face_box(prone_face_box_t *box)
 
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
-    static const char html[] =
-        "<!doctype html>"
-        "<html><head><meta charset=\"utf-8\"><title>prone-like 監視</title>"
-        "<style>"
-        "body{font-family:sans-serif;}"
-        "#wrap{position:relative;width:320px;height:240px;display:inline-block;}"
-        "#stream{width:320px;height:240px;display:block;}"
-        "#face-box{position:absolute;border:2px solid red;display:none;pointer-events:none;box-sizing:border-box;}"
-        "#face-status{margin:12px 0 0;font-size:20px;font-weight:700;}"
-        "#face-status.ok{color:#0f766e;}"
-        "#face-status.ng{color:#b91c1c;}"
-        "#face-status.unknown{color:#a16207;}"
-        "</style>"
-        "</head>"
-        "<body>"
-        "<h1>prone-like 監視</h1>"
-        "<div id=\"wrap\">"
-        "<img id=\"stream\" alt=\"stream\" width=\"320\" height=\"240\">"
-        "<div id=\"face-box\"></div>"
-        "</div>"
-        "<p id=\"face-status\" class=\"unknown\">UNKNOWN: 顔未検出</p>"
-        "<p>状態確認: <a href=\"/health\">/health</a></p>"
-        "<p>枠座標: <a href=\"/face_box\">/face_box</a></p>"
-        "<script>"
-        "const img=document.getElementById('stream');"
-        "const box=document.getElementById('face-box');"
-        "const status=document.getElementById('face-status');"
-        "img.onerror=()=>{img.outerHTML='<p>stream 読み込み失敗</p>';};"
-        "img.src='http://'+location.hostname+':81/stream';"
-        "const clamp=(v,min,max)=>Math.min(max,Math.max(min,v));"
-        "const updateStatus=(monitorStatus)=>{"
-        "if(monitorStatus==='ok'){status.textContent='OK: 顔検出';status.className='ok';return;}"
-        "if(monitorStatus==='ng'){status.textContent='NG: prone-like';status.className='ng';return;}"
-        "status.textContent='UNKNOWN: 顔未検出';status.className='unknown';"
-        "};"
-        "setInterval(async()=>{"
-        "try{"
-        "const healthResp=await fetch('/health',{cache:'no-store'});"
-        "if(!healthResp.ok){box.style.display='none';updateStatus('unknown');}else{"
-        "const h=await healthResp.json();"
-        "updateStatus(typeof h.monitor_status==='string'?h.monitor_status:'unknown');"
-        "const d=h.face_box;"
-        "if(!d||!d.detected){box.style.display='none';}else{"
-        "const x0=clamp(d.x0,0,319),y0=clamp(d.y0,0,239),x1=clamp(d.x1,0,319),y1=clamp(d.y1,0,239);"
-        "if(x1<=x0||y1<=y0){box.style.display='none';}else{"
-        "box.style.left=x0+'px';box.style.top=y0+'px';"
-        "box.style.width=(x1-x0)+'px';box.style.height=(y1-y0)+'px';"
-        "box.style.display='block';"
-        "}"
-        "}"
-        "}"
-        "}catch(e){box.style.display='none';updateStatus('unknown');}"
-        "}," STRINGIFY(UI_POLL_INTERVAL_MS) ");"
-        "</script>"
-        "</body></html>";
-
+    extern const char index_start[] asm("_binary_index_html_start");
+    extern const char index_end[] asm("_binary_index_html_end");
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     httpd_resp_set_hdr(req, "Connection", "close");
-    return httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    return httpd_resp_send(req, index_start, index_end - index_start - 1);
 }
 
 static esp_err_t health_get_handler(httpd_req_t *req)
 {
-    char json[1024];
+    char json[1536];
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     const char *wifi_status = s_wifi_connected ? "connected" : "disconnected";
     const char *camera_status = s_camera_ready ? "ok" : "fault";
     const char *inference_status = inference_status_to_string(s_inference_status);
@@ -556,6 +494,7 @@ static esp_err_t health_get_handler(httpd_req_t *req)
     int written = snprintf(json,
                            sizeof(json),
                            "{\"state\":\"%s\",\"wifi\":\"%s\",\"camera\":\"%s\",\"inference\":\"%s\","
+                           "\"mode\":\"%s\",\"jev_status\":\"%s\",\"jev_probability\":%.4f,\"jev_is_prone\":%s,"
                            "\"face_detected\":%s,\"face_confidence\":%.3f,"
                            "\"face_raw_detected\":%s,\"face_detect_streak\":%d,\"face_detect_confirmed\":%s,"
                            "\"monitor_status\":\"%s\",\"prone_like\":%s,\"prone_like_score\":%.3f,"
@@ -567,6 +506,11 @@ static esp_err_t health_get_handler(httpd_req_t *req)
                            wifi_status,
                            camera_status,
                            inference_status,
+                           s_settings.use_jev ? "jev" : "local",
+                           jev_status_name(s_jev_result.status),
+                           (double)(s_jev_result.status == JEV_OK ? s_jev_result.prone_probability : -1.0f),
+                           s_settings.use_jev && s_jev_result.status == JEV_OK ?
+                               (s_jev_result.is_prone ? "true" : "false") : "null",
                            s_is_face_detected ? "true" : "false",
                            (double)s_face_confidence,
                            s_raw_face_detected ? "true" : "false",
@@ -591,6 +535,7 @@ static esp_err_t health_get_handler(httpd_req_t *req)
                            detected ? box.x1 : -1,
                            detected ? box.y1 : -1,
                            (double)(detected ? box.confidence : 0.0f));
+    xSemaphoreGive(s_state_mutex);
     if (written < 0 || written >= (int)sizeof(json)) {
         return ESP_FAIL;
     }
@@ -605,6 +550,7 @@ static esp_err_t face_box_get_handler(httpd_req_t *req)
 {
     char json[192];
     prone_face_box_t box;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
     bool detected = get_reportable_face_box(&box);
 
     int written = snprintf(json,
@@ -616,6 +562,7 @@ static esp_err_t face_box_get_handler(httpd_req_t *req)
                            detected ? box.x1 : -1,
                            detected ? box.y1 : -1,
                            (double)(detected ? box.confidence : 0.0f));
+    xSemaphoreGive(s_state_mutex);
     if (written < 0 || written >= (int)sizeof(json)) {
         return ESP_FAIL;
     }
@@ -626,160 +573,224 @@ static esp_err_t face_box_get_handler(httpd_req_t *req)
     return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
 }
 
-static esp_err_t stream_get_handler(httpd_req_t *req)
+static void reset_monitor(void)
 {
-    if (!s_camera_ready) {
-        static const char message[] = "camera not ready";
-        httpd_resp_set_status(req, "503 Service Unavailable");
-        httpd_resp_set_type(req, "text/plain");
-        return httpd_resp_send(req, message, HTTPD_RESP_USE_STRLEN);
-    }
-
-    static const char *stream_content_type = "multipart/x-mixed-replace;boundary=frame";
-    static const char *stream_boundary = "\r\n--frame\r\n";
-    char part_header[64];
-    esp_err_t stream_err = ESP_OK;
-
-    httpd_resp_set_type(req, stream_content_type);
-    httpd_resp_set_hdr(req, "Cache-Control", "no-cache");
-    httpd_resp_set_hdr(req, "Connection", "close");
-
-    while (true) {
-        camera_fb_t *fb = esp_camera_fb_get();
-        if (fb == NULL) {
-            ESP_LOGW(TAG, "カメラフレーム取得失敗");
-            continue;
-        }
-
-        int64_t now_ms = esp_timer_get_time() / 1000;
-        if ((now_ms - s_last_inference_ms) >= INFERENCE_INTERVAL_MS) {
-            if (publish_frame_for_inference(fb)) {
-                s_last_inference_ms = now_ms;
-            }
-        }
-
-        int hlen = snprintf(part_header,
-                            sizeof(part_header),
-                            "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
-                            (unsigned)fb->len);
-        if (hlen <= 0 || hlen >= (int)sizeof(part_header)) {
-            esp_camera_fb_return(fb);
-            return ESP_FAIL;
-        }
-
-        stream_err = httpd_resp_send_chunk(req, stream_boundary, strlen(stream_boundary));
-        if (stream_err == ESP_OK) {
-            stream_err = httpd_resp_send_chunk(req, part_header, hlen);
-        }
-        if (stream_err == ESP_OK) {
-            stream_err = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
-        }
-        if (stream_err == ESP_OK) {
-            stream_err = httpd_resp_send_chunk(req, "\r\n", 2);
-        }
-
-        esp_camera_fb_return(fb);
-        if (stream_err != ESP_OK) {
-            break;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(STREAM_PACING_DELAY_MS));
-    }
-
-    ESP_LOGI(TAG, "ストリーム接続終了: %s", esp_err_to_name(stream_err));
-    return stream_err;
+    s_last_face_box = (prone_face_box_t){0};
+    s_is_face_detected = s_raw_face_detected = s_face_detect_confirmed = false;
+    s_face_detect_streak = 0;
+    s_face_confidence = 0;
+    s_last_face_detected_ms = s_face_missing_started_ms = -1;
+    s_face_missing_ms = 0;
+    s_prone_like_detected = false;
+    s_prone_like_score = 0;
+    s_pre_disappear_move_px = s_pre_disappear_area_drop = 0;
+    s_pre_disappear_yaw_trend = s_pre_disappear_vp_trend = s_pre_disappear_fr_trend = 0;
+    s_face_observation_count = s_face_observation_next_index = 0;
+    memset(s_face_observation_history, 0, sizeof(s_face_observation_history));
+    s_monitor_status = MONITOR_STATUS_UNKNOWN;
+    s_inference_status = INFERENCE_STATUS_NOT_READY;
+    s_jev_result = (jev_result_t){.status = JEV_PENDING};
+    if (s_camera_ready && s_wifi_connected) set_system_state(SYSTEM_STATE_MONITORING);
 }
 
-static esp_err_t run_prone_inference(camera_fb_t *fb, bool *is_face_detected, float *confidence)
+static esp_err_t settings_get_handler(httpd_req_t *req)
 {
-    if (fb == NULL || is_face_detected == NULL || confidence == NULL) {
-        return ESP_ERR_INVALID_ARG;
-    }
+    char json[128];
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    snprintf(json, sizeof(json), "{\"mode\":\"%s\",\"threshold\":%.9g,\"key_configured\":%s}",
+             s_settings.use_jev ? "jev" : "local", (double)s_settings.threshold,
+             s_settings.api_key[0] ? "true" : "false");
+    xSemaphoreGive(s_state_mutex);
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    return httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
+}
 
-    esp_err_t err = prone_inference_run_jpeg(fb->buf, fb->len, is_face_detected, confidence);
-    if (err == ESP_OK) {
-        prone_inference_get_last_face_box(&s_last_face_box);
-    } else {
-        s_last_face_box.valid = false;
+static esp_err_t settings_post_handler(httpd_req_t *req)
+{
+    char body[2048];
+    if (req->content_len == 0 || req->content_len >= sizeof(body)) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid settings size");
     }
-    s_inference_status = from_bridge_status(prone_inference_get_status());
+    // Browsers must use JSON; ordinary cross-origin forms cannot change credentials.
+    char content_type[64];
+    if (httpd_req_get_hdr_value_str(req, "Content-Type", content_type, sizeof(content_type)) != ESP_OK ||
+        strcmp(content_type, "application/json")) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "expected application/json");
+    }
+    size_t received = 0;
+    while (received < req->content_len) {
+        int count = httpd_req_recv(req, body + received, req->content_len - received);
+        if (count <= 0) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "incomplete settings");
+        received += count;
+    }
+    body[received] = 0;
+    if (memchr(body, 0, received)) {
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid settings");
+    }
+    monitor_settings_t updated;
+    xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    esp_err_t err = monitor_settings_decode(body, &s_settings, &updated);
+    memset(body, 0, sizeof(body));
+    if (err == ESP_OK) {
+        err = monitor_settings_save(&updated);
+        if (err == ESP_OK) {
+            s_settings = updated;
+            ++s_settings_generation;
+            reset_monitor();
+        }
+    }
+    xSemaphoreGive(s_state_mutex);
+    memset(&updated, 0, sizeof(updated));
+    if (err == ESP_ERR_INVALID_ARG) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid settings");
+    if (err != ESP_OK) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "settings save failed");
+    return settings_get_handler(req);
+}
+
+static esp_err_t stream_get_handler(httpd_req_t *req)
+{
+    uint8_t *work = heap_caps_malloc(INFERENCE_JPEG_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!work) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no stream buffer");
+    httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=frame");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    uint32_t previous = 0;
+    esp_err_t err = ESP_OK;
+    while (true) {
+        size_t len = 0;
+        xSemaphoreTake(s_inference_frame_mutex, portMAX_DELAY);
+        if (s_inference_frame_len && previous != s_frame_sequence) {
+            len = s_inference_frame_len;
+            previous = s_frame_sequence;
+            memcpy(work, s_inference_frame_buf, len);
+        }
+        xSemaphoreGive(s_inference_frame_mutex);
+        if (!len) {
+            xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+            bool ready = s_camera_ready;
+            xSemaphoreGive(s_state_mutex);
+            if (!ready) { err = ESP_FAIL; break; }
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        char header[96];
+        int size = snprintf(header, sizeof(header), "\r\n--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n", (unsigned)len);
+        err = httpd_resp_send_chunk(req, header, size);
+        if (err == ESP_OK) err = httpd_resp_send_chunk(req, (const char *)work, len);
+        if (err == ESP_OK) err = httpd_resp_send_chunk(req, "\r\n", 2);
+        if (err != ESP_OK) break;
+        vTaskDelay(pdMS_TO_TICKS(STREAM_PACING_DELAY_MS));
+    }
+    heap_caps_free(work);
     return err;
 }
 
-static bool publish_frame_for_inference(camera_fb_t *fb)
+static void capture_task(void *arg)
 {
-    if (fb == NULL || fb->buf == NULL || fb->len == 0) {
-        return false;
+    (void)arg;
+    while (true) {
+        camera_fb_t *fb = esp_camera_fb_get();
+        bool valid = fb && fb->len > 0 && fb->len <= INFERENCE_JPEG_MAX_BYTES;
+        xSemaphoreTake(s_inference_frame_mutex, portMAX_DELAY);
+        s_inference_frame_len = valid ? fb->len : 0;
+        if (valid) {
+            memcpy(s_inference_frame_buf, fb->buf, fb->len);
+            ++s_frame_sequence;
+        }
+        xSemaphoreGive(s_inference_frame_mutex);
+        if (fb) esp_camera_fb_return(fb);
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        if (!valid) {
+            if (s_camera_ready) ESP_LOGW(TAG, "カメラ画像の取得失敗または JPEG 上限超過");
+            s_camera_ready = false;
+            s_monitor_status = MONITOR_STATUS_UNKNOWN;
+            s_last_face_box.valid = false;
+            s_is_face_detected = false;
+            s_face_confidence = 0;
+            s_inference_status = INFERENCE_STATUS_FAULT;
+            s_jev_result = (jev_result_t){.status = JEV_CAMERA_ERROR};
+            set_system_state(SYSTEM_STATE_FAULT_CAMERA);
+        } else {
+            if (!s_camera_ready && s_wifi_connected) set_system_state(SYSTEM_STATE_MONITORING);
+            s_camera_ready = true;
+        }
+        xSemaphoreGive(s_state_mutex);
+        vTaskDelay(pdMS_TO_TICKS(valid ? 50 : 200));
     }
-
-    if (fb->len > INFERENCE_JPEG_MAX_BYTES) {
-        ESP_LOGW(TAG, "推論用 JPEG が大きすぎるためスキップ: %u bytes", (unsigned)fb->len);
-        return false;
-    }
-
-    if (s_inference_frame_buf == NULL || s_inference_frame_mutex == NULL) {
-        return false;
-    }
-
-    if (xSemaphoreTake(s_inference_frame_mutex, pdMS_TO_TICKS(5)) != pdTRUE) {
-        return false;
-    }
-
-    memcpy(s_inference_frame_buf, fb->buf, fb->len);
-    s_inference_frame_len = fb->len;
-    s_inference_frame_pending = true;
-    xSemaphoreGive(s_inference_frame_mutex);
-    return true;
 }
 
 static void inference_task(void *arg)
 {
     (void)arg;
-
-    uint8_t *work_buf = (uint8_t *)heap_caps_malloc(INFERENCE_JPEG_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (work_buf == NULL) {
-        work_buf = (uint8_t *)heap_caps_malloc(INFERENCE_JPEG_MAX_BYTES, MALLOC_CAP_8BIT);
-    }
-    if (work_buf == NULL) {
-        ESP_LOGE(TAG, "推論タスク作業バッファ確保失敗");
+    uint8_t *work = heap_caps_malloc(INFERENCE_JPEG_MAX_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!work) {
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
         s_inference_status = INFERENCE_STATUS_FAULT;
+        xSemaphoreGive(s_state_mutex);
         vTaskDelete(NULL);
         return;
     }
-
+    uint32_t generation = UINT32_MAX;
+    bool previous_jev = false;
+    int64_t next_jev = 0, next_local = 0;
     while (true) {
-        size_t frame_len = 0;
-
-        if (xSemaphoreTake(s_inference_frame_mutex, pdMS_TO_TICKS(20)) == pdTRUE) {
-            if (s_inference_frame_pending && s_inference_frame_len > 0) {
-                frame_len = s_inference_frame_len;
-                memcpy(work_buf, s_inference_frame_buf, frame_len);
-                s_inference_frame_pending = false;
+        monitor_settings_t settings;
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        settings = s_settings;
+        uint32_t current_generation = s_settings_generation;
+        xSemaphoreGive(s_state_mutex);
+        int64_t now = esp_timer_get_time() / 1000;
+        if (generation != current_generation) {
+            if (generation == UINT32_MAX || (!previous_jev && settings.use_jev && now >= next_jev)) {
+                next_jev = now;
             }
-            xSemaphoreGive(s_inference_frame_mutex);
+            next_local = now;
+            generation = current_generation;
+            previous_jev = settings.use_jev;
         }
-
-        if (frame_len == 0) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
+        bool due = settings.use_jev ? jev_schedule_due(now, &next_jev) : now >= next_local;
+        if (!due) { vTaskDelay(pdMS_TO_TICKS(20)); continue; }
+        if (!settings.use_jev) next_local = now + INFERENCE_INTERVAL_MS;
+        size_t len;
+        xSemaphoreTake(s_inference_frame_mutex, portMAX_DELAY);
+        len = s_inference_frame_len;
+        if (len) memcpy(work, s_inference_frame_buf, len);
+        xSemaphoreGive(s_inference_frame_mutex);
+        jev_result_t result = {.status = JEV_CAMERA_ERROR};
+        bool detected = false;
+        float confidence = 0;
+        prone_face_box_t box = {0};
+        esp_err_t err = ESP_FAIL;
+        if (settings.use_jev) {
+            if (len) {
+                if (!settings.api_key[0]) result.status = JEV_NOT_CONFIGURED;
+                else if (time(NULL) < 1704067200) result.status = JEV_CLOCK_NOT_READY;
+                else result = jev_classify(work, len, settings.api_key, settings.threshold);
+            }
+        } else if (len) {
+            err = prone_inference_init();
+            if (err == ESP_OK) err = prone_inference_run_jpeg(work, len, &detected, &confidence);
+            if (err == ESP_OK) prone_inference_get_last_face_box(&box);
         }
-
-        camera_fb_t fb = {
-            .buf = work_buf,
-            .len = frame_len,
-            .width = 320,
-            .height = 240,
-            .format = PIXFORMAT_JPEG,
-        };
-        bool is_face_detected = false;
-        float confidence = 0.0f;
-        esp_err_t infer_err = run_prone_inference(&fb, &is_face_detected, &confidence);
-        if (infer_err == ESP_OK) {
-            s_inference_status = INFERENCE_STATUS_OK;
-        } else if (infer_err != ESP_ERR_NOT_FOUND) {
-            s_inference_status = INFERENCE_STATUS_FAULT;
+        // Skip slots that passed while the previous request was still running.
+        if (settings.use_jev) (void)jev_schedule_due(esp_timer_get_time() / 1000, &next_jev);
+        memset(settings.api_key, 0, sizeof(settings.api_key));
+        xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+        // A completed request belongs only to the settings used to start it.
+        if (generation == s_settings_generation && s_camera_ready) {
+            if (settings.use_jev) {
+                s_jev_result = result;
+                s_inference_status = result.status == JEV_OK ? INFERENCE_STATUS_OK : INFERENCE_STATUS_FAULT;
+                s_monitor_status = result.status == JEV_OK ?
+                    (result.is_prone ? MONITOR_STATUS_NG : MONITOR_STATUS_OK) : MONITOR_STATUS_UNKNOWN;
+                set_system_state(result.status != JEV_OK ? SYSTEM_STATE_FAULT_INFERENCE :
+                    (result.is_prone ? SYSTEM_STATE_ALERT : SYSTEM_STATE_MONITORING));
+            } else {
+                s_last_face_box = box;
+                s_inference_status = err == ESP_OK ? INFERENCE_STATUS_OK : INFERENCE_STATUS_FAULT;
+                update_face_monitor(detected, confidence);
+            }
         }
-        update_face_monitor(is_face_detected, confidence);
+        xSemaphoreGive(s_state_mutex);
     }
 }
 
@@ -808,7 +819,7 @@ static esp_err_t start_inference_task(void)
 
     BaseType_t task_ok = xTaskCreate(inference_task,
                                      "inference_task",
-                                     8192,
+                                     12288,
                                      NULL,
                                      tskIDLE_PRIORITY + 1,
                                      &s_inference_task_handle);
@@ -819,6 +830,11 @@ static esp_err_t start_inference_task(void)
         return ESP_FAIL;
     }
 
+    if (xTaskCreate(capture_task, "capture_task", 4096, NULL, tskIDLE_PRIORITY + 1, NULL) != pdPASS) {
+        vTaskDelete(s_inference_task_handle);
+        s_inference_task_handle = NULL;
+        return ESP_ERR_NO_MEM;
+    }
     ESP_LOGI(TAG, "推論タスク開始");
     return ESP_OK;
 }
@@ -943,6 +959,7 @@ static esp_err_t start_http_server(void)
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.stack_size = 8192;
     config.lru_purge_enable = true;
     config.keep_alive_enable = false;
 
@@ -972,6 +989,10 @@ static esp_err_t start_http_server(void)
         .user_ctx = NULL,
     };
 
+    const httpd_uri_t settings_get_uri = {.uri = "/settings", .method = HTTP_GET, .handler = settings_get_handler};
+    const httpd_uri_t settings_post_uri = {.uri = "/settings", .method = HTTP_POST, .handler = settings_post_handler};
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &settings_get_uri));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_http_server, &settings_post_uri));
     httpd_register_uri_handler(s_http_server, &root_uri);
     httpd_register_uri_handler(s_http_server, &health_uri);
     httpd_register_uri_handler(s_http_server, &face_box_uri);
@@ -1072,12 +1093,8 @@ static void wifi_event_handler(void *arg,
 
 static esp_err_t init_nvs(void)
 {
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
-    }
-    return err;
+    // Settings now contain credentials; initialization failure must not erase them.
+    return nvs_flash_init();
 }
 
 static esp_err_t start_wifi_sta(void)
@@ -1113,7 +1130,6 @@ static esp_err_t start_wifi_sta(void)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     s_last_wifi_retry_ms = 0;
-    s_last_inference_ms = 0;
 
     const esp_timer_create_args_t timer_args = {
         .callback = wifi_retry_timer_cb,
@@ -1149,7 +1165,7 @@ static esp_err_t init_camera(void)
         .ledc_timer = LEDC_TIMER_0,
         .ledc_channel = LEDC_CHANNEL_0,
         .pixel_format = PIXFORMAT_JPEG,
-        .frame_size = FRAMESIZE_QVGA,
+        .frame_size = FRAMESIZE_VGA,
         .jpeg_quality = 10,
         .fb_count = 1,
         .fb_location = CAMERA_FB_IN_PSRAM,
@@ -1172,6 +1188,9 @@ static esp_err_t init_camera(void)
 void app_main(void)
 {
     ESP_ERROR_CHECK(init_nvs());
+    s_state_mutex = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(s_state_mutex ? ESP_OK : ESP_ERR_NO_MEM);
+    ESP_ERROR_CHECK(monitor_settings_load(&s_settings));
     set_system_state(SYSTEM_STATE_BOOT);
 
     if (strcmp(WIFI_SSID, "YOUR_SSID") == 0 || strcmp(WIFI_PASSWORD, "YOUR_PASSWORD") == 0) {
@@ -1191,20 +1210,11 @@ void app_main(void)
             ESP_LOGW(TAG, "カメラが未準備のため /stream は 503 を返します");
         }
 
-        esp_err_t infer_init_err = prone_inference_init();
-        if (infer_init_err != ESP_OK) {
-            s_inference_status = from_bridge_status(prone_inference_get_status());
-            ESP_LOGW(TAG, "推論初期化未完了: %s", esp_err_to_name(infer_init_err));
-        } else {
-            s_inference_status = INFERENCE_STATUS_OK;
-        }
-
-        if (s_camera_ready && infer_init_err == ESP_OK) {
-            esp_err_t task_err = start_inference_task();
-            if (task_err != ESP_OK) {
-                s_inference_status = INFERENCE_STATUS_FAULT;
-                ESP_LOGW(TAG, "推論タスク開始失敗: %s", esp_err_to_name(task_err));
-            }
+        esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+        esp_sntp_setservername(0, "pool.ntp.org");
+        esp_sntp_init();
+        if (s_camera_ready) {
+            ESP_ERROR_CHECK(start_inference_task());
         }
 
         ESP_ERROR_CHECK(start_http_server());
