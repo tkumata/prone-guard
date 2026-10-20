@@ -4,5 +4,5 @@
     "IDF_TARGET": "esp32s3"
   },
   "idf.flashType": "UART",
-  "idf.currentSetup": "/Users/kumata/.espressif/v6.0/esp-idf"
+  "idf.currentSetup": "/Users/kumata/.espressif/v6.0.3/esp-idf"
 }
