@@ -4,6 +4,7 @@
 
 #include "dl_image_define.hpp"
 #include "dl_image_jpeg.hpp"
+#include "dl_image_process.hpp"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -84,6 +85,30 @@ esp_err_t prone_inference_run_jpeg(const uint8_t *jpeg_data, size_t jpeg_len, bo
     if (rgb.data == nullptr) {
         s_status = PRONE_INFERENCE_STATUS_FAULT;
         return ESP_FAIL;
+    }
+
+    // Keep the existing pixel thresholds and face-box coordinates at QVGA.
+    if (rgb.width != 320 || rgb.height != 240) {
+        dl::image::img_t small = {
+            .data = heap_caps_malloc(320 * 240 * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+            .width = 320,
+            .height = 240,
+            .pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB888,
+        };
+        if (small.data == nullptr) {
+            heap_caps_free(rgb.data);
+            s_status = PRONE_INFERENCE_STATUS_FAULT;
+            return ESP_ERR_NO_MEM;
+        }
+        dl::image::ImageTransformer transformer;
+        esp_err_t err = transformer.set_src_img(rgb).set_dst_img(small).transform();
+        heap_caps_free(rgb.data);
+        if (err != ESP_OK) {
+            heap_caps_free(small.data);
+            s_status = PRONE_INFERENCE_STATUS_FAULT;
+            return err;
+        }
+        rgb = small;
     }
 
     std::list<dl::detect::result_t> &result = s_detector->run(rgb);

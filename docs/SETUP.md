@@ -49,12 +49,12 @@
 
    - `idf.py` が実行できれば基本導入は完了
    - 通常の zsh で `idf.py` が見つからない場合でも、ESP-IDF Terminal で実行できれば導入は正常
-   - 例: `$HOME/.espressif/v5.5.3/esp-idf/export.sh` が存在する環境では、ESP-IDF 本体は `~/.espressif` 配下にある
+   - 例: `$HOME/.espressif/v6.0/esp-idf/export.sh` が存在する環境では、ESP-IDF 本体は `~/.espressif` 配下にある
 
 VS Code 拡張ではなく、ターミナルで実行する場合:
 
 ```shell
-source ~/.espressif/v5.5.3/esp-idf/export.sh
+source ~/.espressif/v6.0/esp-idf/export.sh
 idf.py --version
 ```
 
@@ -199,7 +199,7 @@ idf.py --version
    - ケーブル交換、USB ハブ経由回避、ドライバ再確認を実施
 
 2. `idf.py` が見つからない
-   - `source ~/.espressif/v5.5.3/esp-idf/export.sh` を実施
+   - `source ~/.espressif/v6.0/esp-idf/export.sh` を実施
 
 3. フラッシュ失敗
    - BOOT ボタン押下で書き込みモードに入れて再実行する
@@ -212,3 +212,39 @@ idf.py --version
 - 使用した ESP-IDF バージョンを `README.md` または `docs` に固定記録する
 - `sdkconfig.defaults` を管理し、設定差分を抑制する
 - 依存コンポーネントのバージョンを明示固定する
+
+## 11. Issue #10 のビルドと検証
+
+- 検証対象の ESP-IDF は 6.0 とする。
+- ESP-DL 3.3.14 と human_face_detect 0.5.1 を使用する。
+- ESP-IDF の版を切り替えた場合は、別のビルドディレクトリを使う。
+- `espressif/cjson` は承認済みの追加依存である。
+- Jev の HTTPS は `main/gts_root_r4.pem` を `cert_pem` に指定する。
+- 証明書バンドルと SDK の修正は不要である。
+- `sdkconfig.defaults` は証明書の日付検証を有効にする。
+- 既存 `sdkconfig` を使う場合も、次の設定を有効にする。
+  - `CONFIG_MBEDTLS_HAVE_TIME=y`
+  - `CONFIG_MBEDTLS_HAVE_TIME_DATE=y`
+
+```sh
+idf.py -B build-issue-10 build
+IDF_BUILD_DIR=build-issue-10 ./tests/run.sh
+```
+
+ホストテストは C コンパイラと AddressSanitizer / UndefinedBehaviorSanitizer を使用する。
+実 API key は自動テストに使用しない。
+実機検証では、再起動後の設定、ブラウザ未接続時の送信を確認する。
+通信失敗時の `UNKNOWN` と、10 分間の連続配信も確認する。
+識別精度は、正解ラベルを付けた実画像で別途確認する。
+
+### Jev のルート証明書
+
+- 公式配布元: https://pki.goog/repo/certs/gtsr4.pem
+- 種別: 自己署名の GTS Root R4。
+- 有効期限: 2036-06-22 00:00:00 UTC。
+- SHA-256: `349DFA4058C5E263123B398AE795573C4E1313C83FE68F93556CD5E8031B3C7D`
+- サーバ証明書、署名、ホスト名、有効期限の検証を維持する。
+- サーバ証明書の通常更新だけでは、ルート証明書の変更は不要である。
+- 接続先の認証局変更、CA の失効、期限到来時は証明書を更新する。
+- 更新後は証明書を埋め込んで再ビルド・再配布する。
+- 証明書バンドルの経路を使わず、ESP-IDF 6.0 の不具合を回避する。
