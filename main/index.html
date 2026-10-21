@@ -13,6 +13,7 @@ body{font-family:sans-serif;margin:20px}#wrap{position:relative;width:320px;heig
 <div id="wrap"><img id="stream" width="320" height="240" alt="カメラ映像"><div id="face-box"></div></div>
 <p id="status" class="unknown" role="status">UNKNOWN: 判定待ち</p>
 <p id="detail"></p>
+<p id="face-error" class="ng" role="status"></p>
 <form id="settings">
 <label>判定方式 <select id="mode" name="mode"><option value="local">prone-like (ローカル)</option><option value="jev">Jev 1.14</option></select></label>
 <label>Jev 判定閾値 <input id="threshold" name="threshold" type="number" min="0" max="1" step="any" value="0.5" required></label>
@@ -28,6 +29,7 @@ const image=document.getElementById('stream');
 const box=document.getElementById('face-box');
 const status=document.getElementById('status');
 const detail=document.getElementById('detail');
+const faceError=document.getElementById('face-error');
 const mode=document.getElementById('mode');
 const threshold=document.getElementById('threshold');
 const key=document.getElementById('api-key');
@@ -67,12 +69,14 @@ async function poll(){
    detail.textContent='prone-like / 推論: '+health.inference;
   }
   const face=health.face_box;
+  faceError.textContent=jev&&face&&face.status!=='ok'&&face.status!=='pending'?
+   '顔枠エラー: '+(errors[face.status]||'顔の回答が不正です'):'';
   box.style.display='none';
-  if(!jev&&face&&face.detected){
+  if(face&&face.detected){
    const x0=clamp(face.x0,0,319),y0=clamp(face.y0,0,239),x1=clamp(face.x1,0,319),y1=clamp(face.y1,0,239);
    if(x1>x0&&y1>y0){Object.assign(box.style,{left:x0+'px',top:y0+'px',width:(x1-x0)+'px',height:(y1-y0)+'px',display:'block'});}
   }
- }catch{box.style.display='none';status.className='unknown';status.textContent='UNKNOWN: 状態を取得できません';}
+ }catch{box.style.display='none';faceError.textContent='';status.className='unknown';status.textContent='UNKNOWN: 状態を取得できません';}
  finally{setTimeout(poll,500);}
 }
 poll();

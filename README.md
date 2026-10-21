@@ -6,6 +6,8 @@ Freenove ESP32-S3 WROOM CAM を使い、顔検知と `prone-like` 推定を監�
 Jev 1.14 に画像を送る姿勢判定を Web 管理画面で切り替えます。
 ローカル推定は顔検知ベースの近似です。Jev の実画像での識別精度は未検証です。
 
+![prone-guard-espdl](docs/images/prone-guard-espdl.png)
+
 ## 目的
 
 - ESP-IDF + ESP-DL でローカル推論を行う。
@@ -21,7 +23,9 @@ Jev 1.14 に画像を送る姿勢判定を Web 管理画面で切り替えます
 
 ## Jev の設定と検証
 
-1. ESP-IDF **6.0**、ESP-DL **3.3.14**、human_face_detect **0.5.1** でビルドする。
+![prone-guard-jev](docs/images/prone-guard-jev.png)
+
+1. ESP-IDF **6.0.3**、ESP-DL **3.3.14**、human_face_detect **0.5.1** でビルドする。
 2. Web 管理画面の `/` を開く。
 3. API key と閾値を入力し、判定方式を `Jev 1.14` にして保存する。
 4. 判定結果またはエラーを画面と `/health` で確認する。
@@ -31,6 +35,10 @@ Jev 1.14 に画像を送る姿勢判定を Web 管理画面で切り替えます
 - Jev は 10 秒周期で送信する。8 秒でタイムアウトし、再送しない。
 - タイムアウト後の送信は次の 10 秒周期に行う。
 - 閾値の初期値は 0.5。判別不能と通信失敗は `UNKNOWN` とする。
+- 同じ画像に顔存在の Noul と顔座標の Box を問い合わせる。
+- 顔存在確率が 0.5 以上で、有効な座標があれば CSS の赤枠を表示する。
+- 顔枠の取得失敗は画面にエラーを表示し、正常な姿勢判定は維持する。
+- 顔枠は次回結果まで維持するため、現在の映像と位置がずれる場合がある。
 - API key、判定方式、閾値は NVS に保存し、再起動後も維持する。
 - API key の空欄保存では既存の key を変更しない。
 - API key は画面や取得 API に返さない。管理画面の入力通信は HTTP。
@@ -44,6 +52,7 @@ Jev 1.14 に画像を送る姿勢判定を Web 管理画面で切り替えます
 ```sh
 idf.py build
 ./tests/run.sh
+node tests/test_ui.cjs
 ```
 
 別のビルドディレクトリを使う場合は、テストに
@@ -55,7 +64,7 @@ idf.py build
 - `main/main.c` に Wi-Fi STA 接続、`GET /`、`GET /health` の最小実装を追加済み。
 - `GET /stream` は MJPEG 配信を実装済み（カメラ初期化失敗時のみ `503`）。
 - 顔矩形の時系列から `missing_ms`、`pre_disappear_move_px`、`pre_disappear_area_drop` を算出し、`prone-like` を推定するロジックを実装済み。
-- 顔検知成立時のみ、検知領域へ赤枠を重畳して `/stream` に配信する。
+- 顔検知成立時のみ、配信映像の上に CSS の赤枠を表示する。
 - Web UI は `OK: 顔検出`、`UNKNOWN: 顔未検出`、`NG: prone-like` を表示する。
 - `main/prone_inference_bridge.cpp` で `human_face_detect_msr_s8_v1.espdl` と `human_face_detect_mnp_s8_v1.espdl` の2モデルを用いた推論実装を追加済み。
 - ESP-DL と `esp32-camera` 依存は `main/idf_component.yml` に追加済み。

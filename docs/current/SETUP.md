@@ -239,7 +239,7 @@ IDF_BUILD_DIR=build-issue-10 ./tests/run.sh
 
 ### Jev のルート証明書
 
-- 公式配布元: https://pki.goog/repo/certs/gtsr4.pem
+- 公式配布元: <https://pki.goog/repo/certs/gtsr4.pem>
 - 種別: 自己署名の GTS Root R4。
 - 有効期限: 2036-06-22 00:00:00 UTC。
 - SHA-256: `349DFA4058C5E263123B398AE795573C4E1313C83FE68F93556CD5E8031B3C7D`

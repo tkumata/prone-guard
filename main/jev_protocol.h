@@ -19,9 +19,17 @@ typedef enum {
 } jev_status_t;
 
 typedef struct {
+    bool detected;
+    int x0, y0, x1, y1;
+    float confidence;
+} jev_face_box_t;
+
+typedef struct {
     jev_status_t status;
     float prone_probability;
     bool is_prone;
+    jev_status_t face_status;
+    jev_face_box_t face_box;
 } jev_result_t;
 
 extern const char jev_request_json[];
