@@ -4,7 +4,7 @@
 
 - Phase: completed
 - Approval: approved (2026-10-21)
-- 対象 Issue: https://github.com/tkumata/prone-guard/issues/13
+- 対象 Issue: <https://github.com/tkumata/prone-guard/issues/13>
 - 作業ブランチ: `feat/issue-13`
 - ユーザの「OK. 進めてください。」により実装が承認された。
 - Open Questions への回答は反映済みである (2026-10-21)。
