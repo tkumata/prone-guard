@@ -6,6 +6,8 @@ Freenove ESP32-S3 WROOM CAM を使い、顔検知と `prone-like` 推定を監�
 Jev 1.14 に画像を送る姿勢判定を Web 管理画面で切り替えます。
 ローカル推定は顔検知ベースの近似です。Jev の実画像での識別精度は未検証です。
 
+![prone-guard-espdl](docs/images/prone-guard-espdl.png)
+
 ## 目的
 
 - ESP-IDF + ESP-DL でローカル推論を行う。
@@ -21,7 +23,9 @@ Jev 1.14 に画像を送る姿勢判定を Web 管理画面で切り替えます
 
 ## Jev の設定と検証
 
-1. ESP-IDF **6.0**、ESP-DL **3.3.14**、human_face_detect **0.5.1** でビルドする。
+![prone-guard-jev](docs/images/prone-guard-jev.png)
+
+1. ESP-IDF **6.0.3**、ESP-DL **3.3.14**、human_face_detect **0.5.1** でビルドする。
 2. Web 管理画面の `/` を開く。
 3. API key と閾値を入力し、判定方式を `Jev 1.14` にして保存する。
 4. 判定結果またはエラーを画面と `/health` で確認する。
