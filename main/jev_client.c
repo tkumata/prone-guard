@@ -80,7 +80,6 @@ static esp_err_t receive_event(esp_http_client_event_t *event)
         int socket = esp_http_client_get_socket(event->client);
         atomic_store(&response->socket, socket);
         if (atomic_load(&response->expired) && socket >= 0) shutdown(socket, SHUT_RDWR);
-        esp_http_client_set_timeout_ms(event->client, 100);
     }
     if (event->event_id == HTTP_EVENT_ON_HEADER || event->event_id == HTTP_EVENT_ON_DATA) {
         response->stage = "receive_response";

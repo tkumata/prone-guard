@@ -442,10 +442,26 @@ static void set_system_state(system_state_t next_state)
     s_system_state = next_state;
 }
 
+static jev_status_t get_jev_face_status(void)
+{
+    return s_jev_result.status == JEV_OK || s_jev_result.status == JEV_UNJUDGEABLE ?
+        s_jev_result.face_status : s_jev_result.status;
+}
+
 static bool get_reportable_face_box(prone_face_box_t *box)
 {
     if (box == NULL) {
         return false;
+    }
+
+    if (s_settings.use_jev) {
+        const jev_face_box_t *face = &s_jev_result.face_box;
+        bool detected = get_jev_face_status() == JEV_OK && face->detected;
+        *box = (prone_face_box_t){
+            .valid = detected, .x0 = face->x0, .y0 = face->y0,
+            .x1 = face->x1, .y1 = face->y1, .confidence = face->confidence,
+        };
+        return detected;
     }
 
     *box = s_last_face_box;
@@ -501,7 +517,7 @@ static esp_err_t health_get_handler(httpd_req_t *req)
                            "\"face_missing_ms\":%d,\"pre_disappear_move_px\":%.1f,\"pre_disappear_area_drop\":%.3f,"
                            "\"pre_disappear_yaw_trend\":%.3f,\"pre_disappear_vp_trend\":%.3f,\"pre_disappear_fr_trend\":%.3f,"
                            "\"orientation\":{\"yaw_asym\":%.3f,\"vert_prop\":%.3f,\"fore_ratio\":%.3f,\"valid\":%s},"
-                           "\"face_box\":{\"detected\":%s,\"x0\":%d,\"y0\":%d,\"x1\":%d,\"y1\":%d,\"confidence\":%.3f}}",
+                           "\"face_box\":{\"status\":\"%s\",\"detected\":%s,\"x0\":%d,\"y0\":%d,\"x1\":%d,\"y1\":%d,\"confidence\":%.3f}}",
                            state_to_string(s_system_state),
                            wifi_status,
                            camera_status,
@@ -529,6 +545,7 @@ static esp_err_t health_get_handler(httpd_req_t *req)
                            (double)(orient.valid ? orient.vert_prop : -1.0f),
                            (double)(orient.valid ? orient.fore_ratio : -1.0f),
                            orient.valid ? "true" : "false",
+                           s_settings.use_jev ? jev_status_name(get_jev_face_status()) : "ok",
                            detected ? "true" : "false",
                            detected ? box.x0 : -1,
                            detected ? box.y0 : -1,
@@ -555,7 +572,8 @@ static esp_err_t face_box_get_handler(httpd_req_t *req)
 
     int written = snprintf(json,
                            sizeof(json),
-                           "{\"detected\":%s,\"x0\":%d,\"y0\":%d,\"x1\":%d,\"y1\":%d,\"confidence\":%.3f}",
+                           "{\"status\":\"%s\",\"detected\":%s,\"x0\":%d,\"y0\":%d,\"x1\":%d,\"y1\":%d,\"confidence\":%.3f}",
+                           s_settings.use_jev ? jev_status_name(get_jev_face_status()) : "ok",
                            detected ? "true" : "false",
                            detected ? box.x0 : -1,
                            detected ? box.y0 : -1,

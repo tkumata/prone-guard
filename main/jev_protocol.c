@@ -15,7 +15,11 @@ const char jev_request_json[] =
     "facing away from it. A head turned sideways does not change this classification.\","
     "\"not_prone\":\"The infant is visibly lying on the back or side, or visibly in another posture that is not prone.\","
     "\"unjudgeable\":\"No infant is visible; the intended infant cannot be uniquely identified; or occlusion, "
-    "darkness, blur, framing, or an ambiguous transitional posture prevents distinguishing prone from other torso postures.\"}}}}";
+    "darkness, blur, framing, or an ambiguous transitional posture prevents distinguishing prone from other torso postures.\"}},"
+    "\"face_present\":{\"type\":\"noul\",\"instructions\":\"Is the face of the infant being monitored visible in `photo`? "
+    "Answer no if the intended infant cannot be uniquely identified. Ignore other people's faces.\"},"
+    "\"face_box\":{\"type\":\"box\",\"instructions\":\"Locate the visible face of the infant being monitored in `photo`. "
+    "Enclose that infant's face, not the whole head or body, and ignore other people's faces.\"}}}";
 
 const char *jev_status_name(jev_status_t status)
 {
@@ -33,9 +37,53 @@ const char *jev_status_name(jev_status_t status)
     }
 }
 
+static bool is_unit_number(const cJSON *value)
+{
+    return cJSON_IsNumber(value) && isfinite(value->valuedouble) &&
+        value->valuedouble >= 0 && value->valuedouble <= 1;
+}
+
+static void parse_face(const cJSON *answers, jev_result_t *result)
+{
+    cJSON *presence = cJSON_GetObjectItemCaseSensitive(answers, "face_present");
+    cJSON *type = cJSON_GetObjectItemCaseSensitive(presence, "type");
+    cJSON *probability = cJSON_GetObjectItemCaseSensitive(presence, "noul");
+    if (!cJSON_IsObject(presence) || !cJSON_IsString(type) ||
+        strcmp(type->valuestring, "noul") || !is_unit_number(probability)) return;
+    if (probability->valuedouble < 0.5) {
+        result->face_status = JEV_OK;
+        return;
+    }
+
+    cJSON *answer = cJSON_GetObjectItemCaseSensitive(answers, "face_box");
+    type = cJSON_GetObjectItemCaseSensitive(answer, "type");
+    cJSON *box = cJSON_GetObjectItemCaseSensitive(answer, "box");
+    cJSON *confidence = cJSON_GetObjectItemCaseSensitive(answer, "confidence");
+    cJSON *left = cJSON_GetObjectItemCaseSensitive(box, "left");
+    cJSON *right = cJSON_GetObjectItemCaseSensitive(box, "right");
+    cJSON *top = cJSON_GetObjectItemCaseSensitive(box, "top");
+    cJSON *bottom = cJSON_GetObjectItemCaseSensitive(box, "bottom");
+    if (!cJSON_IsObject(answer) || !cJSON_IsString(type) || strcmp(type->valuestring, "box") ||
+        !cJSON_IsObject(box) || !is_unit_number(confidence) || !is_unit_number(left) ||
+        !is_unit_number(right) || !is_unit_number(top) || !is_unit_number(bottom) ||
+        left->valuedouble >= right->valuedouble || top->valuedouble >= bottom->valuedouble) return;
+
+    jev_face_box_t face = {
+        .x0 = (int)fmin(left->valuedouble * 320, 319),
+        .y0 = (int)fmin(top->valuedouble * 240, 239),
+        .x1 = (int)fmin(right->valuedouble * 320, 319),
+        .y1 = (int)fmin(bottom->valuedouble * 240, 239),
+        .confidence = (float)confidence->valuedouble,
+    };
+    if (face.x1 <= face.x0 || face.y1 <= face.y0) return;
+    face.detected = true;
+    result->face_box = face;
+    result->face_status = JEV_OK;
+}
+
 jev_result_t jev_parse_response(const char *json, float threshold)
 {
-    jev_result_t result = {.status = JEV_INVALID_RESPONSE};
+    jev_result_t result = {.status = JEV_INVALID_RESPONSE, .face_status = JEV_INVALID_RESPONSE};
     cJSON *root = cJSON_ParseWithOpts(json, NULL, true);
     cJSON *answers = cJSON_GetObjectItemCaseSensitive(root, "answers");
     cJSON *posture = cJSON_GetObjectItemCaseSensitive(answers, "posture");
@@ -61,6 +109,7 @@ jev_result_t jev_parse_response(const char *json, float threshold)
     if (valid && known_choice && fabs(sum - 1.0) <= 0.01) {
         result.status = !strcmp(choice->valuestring, "unjudgeable") ? JEV_UNJUDGEABLE : JEV_OK;
         result.is_prone = result.status == JEV_OK && result.prone_probability >= threshold;
+        parse_face(answers, &result);
     }
     cJSON_Delete(root);
     return result;
