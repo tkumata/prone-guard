@@ -10,5 +10,6 @@
     "IDF_TARGET": "esp32s3"
   },
   "idf.flashType": "UART",
-  "idf.currentSetup": "${env:HOME}/.espressif/v6.0.3/esp-idf"
+  "idf.currentSetup": "${env:HOME}/.espressif/v6.0.3/esp-idf",
+  "idf.extensionActivationMode": "never"
 }
