@@ -16,7 +16,7 @@
 - Switch Science Conta VL53L5CX、8×8、1 セル 1 対象。
 - SSD1306 搭載の 128×64px モノクロ OLED。3.3V 電源・ロジック対応の 4 ピン I²C モジュールを使用する。
 - Wi-Fi STA、HTTPS、JSONL、NTP。
-- Rust 1.99.0 / edition 2024、macOS 27.x、Debian 13.7。
+- Rust 1.99.1 / edition 2024、macOS 27.x、Debian 13.7。
 - 同じリポジトリの `edge/` に Rust アプリを配置する。
 - 医療用途認証、通知アプリ、画像送信、モデル学習は対象外。
 

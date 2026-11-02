@@ -101,7 +101,7 @@ CA 秘密鍵、デバイス秘密鍵、`device.json`、HMAC キーは転送し�
 ## 1. 開発環境
 
 - ファームウェア: ESP-IDF 6.0.3、ESP-DL 3.3.14、human_face_detect 0.5.1。
-- エッジ: Rust 1.99.0、edition 2024。
+- エッジ: Rust 1.99.1、edition 2024。
 - OS: macOS 27.x または Debian 13.7。
 - USB 設定: ESP-IDF の Python と pyserial。
 - 証明書と設定の生成: Python 3 と OpenSSL。
@@ -152,20 +152,40 @@ SQLite と TLS ライブラリは Cargo の依存としてビルドする。
 
 ### 2.1. 深度センサー
 
+Switch Science の Conta VL53L5CX（商品番号 10281）を対象とする。
+下表の番号は Conta コネクタのピン番号であり、Freenove の物理ピン番号ではない。実物のシルク印刷で端子を特定する。
+
 | Conta 端子 | Freenove 側 |
 | --- | --- |
-| SCL | GPIO21 |
-| SDA | GPIO14 |
-| IO4 / INT | GPIO47 |
-| GND | GND |
-| 3.3V | 3V3 |
+| 5: SCL | GPIO21 |
+| 4: SDA | GPIO14 |
+| 3: IO4 / INT | GPIO47（省略可） |
+| 2: GND | GND |
+| 1: 3.3V | 3V3 |
 
-カメラ用の GPIO4 / GPIO5 とは別の I²C を使用する。
+IO4 は Conta 規格の端子名であり、Freenove の GPIO4 へ接続しない。
+現行コードは `vl53l5cx_check_data_ready()` でポーリングし、GPIO47 は入力に設定するだけで読み取らないため、INT 配線は必須ではない。
+Conta 回路図では INT は 47kΩ で IOVDD へプルアップされ、LPn は 47kΩ で High、I2C_RST は 47kΩ で Low に固定される。LPn / I2C_RST の追加配線は不要である。
+IOVDD は R6（0Ω）を介して 3.3V と接続される標準実装を使用し、別電圧を印加しない。
+
+カメラの SCCB は GPIO4 / GPIO5 の I2C0、新 I²C ドライバを使用する。
 深度の I²C は I2C1、400kHz、7bit アドレス 0x29 とする。
+データシートの 8bit 表記 `0x52` をそのまま ESP-IDF のアドレスへ指定しない。
+GPIO が別でも、同じ I²C コントローラを別バスとして二重確保することはできない。
+`sdkconfig.defaults` で `CONFIG_SCCB_HARDWARE_I2C_DRIVER_NEW=y` と `CONFIG_SCCB_HARDWARE_I2C_PORT0=y` を指定し、`main.c` でもビルド時に検査する。
+既存の `sdkconfig` は defaults より優先される。再利用する場合は、対象ビルドの `idf.py menuconfig` の **Component config → Camera configuration** で **I2C driver selection for SCCB = New I2C driver**、**I2C peripheral to use for SCCB = I2C0** を選択する。
+`build/setup/` を再利用する場合のコマンドは次のとおり。設定・鍵や NVS を消去する必要はない。
+
+```sh
+idf.py -B build/setup -DSDKCONFIG="$PWD/build/setup/sdkconfig" menuconfig
+```
+
 ULD は 8×8、5Hz、最も強い対象 1 個で測距する。
 マイコンは最新の測距結果を毎秒送信する。
 Conta は測距中に約 100mA を使用するため、電源の余裕を実測する。
 実際の基板型式、端子、マップの向きを照合してから評価する。
+ピン割当の根拠は [Freenove 公式ピン配置](https://github.com/Freenove/Freenove_ESP32_S3_WROOM_Board/blob/main/ESP32S3_Pinout.png)、[Conta 製品資料](https://www.switch-science.com/products/10281)、[Conta 回路図](https://doc.switch-science.com/media/files/19d73541-d39a-4e3c-bf7a-69a2a56af50a.pdf) による。
+GPIO14 / GPIO21 / GPIO47 は同ピン配置でカメラ、PSRAM（GPIO35〜37）、SD（GPIO38〜40）、USB（GPIO19 / GPIO20）、RGB LED（GPIO48）と重複しない。
 
 ### 2.2. OLED SSD1306
 
@@ -174,6 +194,8 @@ Conta は測距中に約 100mA を使用するため、電源の余裕を実測�
 SSD1306 はコントローラ名であり、購入する基板の電源条件・端子順・解像度・アドレスを製品資料で照合する。
 本仕様では 7bit アドレスを `0x3C` とする。`0x3D` の基板は製品の手順で `0x3C` に設定できるものを使用する。
 書込み用 8bit 表記の `0x78` と混同しない。
+既存の [climate-monitor](https://github.com/tkumata/climate-monitor/blob/main/climate-monitor.ino) と同じ 128×64px、`0x3C`、内部チャージポンプを使う構成であり、同リポジトリの [配線表](https://github.com/tkumata/climate-monitor#ssd1306) も VDD=3V3 としている。
+ここでは Freenove の GPIO14 / GPIO21 を使用するため、同配線表の A4 / A5 をそのまま適用しない。
 
 | OLED | Freenove | 接続方法 |
 | ---- | -------- | ------ |
@@ -186,7 +208,8 @@ I2C1、400kHz を共有し、深度センサーの `0x29` と OLED の `0x3C` �
 この 4 ピン I²C モジュールでは SPI 用の CS / DC や追加の GPIO は使用しない。
 SDA / SCL のプルアップ先は 3.3V とする。5V へプルアップされる基板をそのまま接続しない。
 両基板の実装済み抵抗を確認し、並列接続後の合成抵抗と配線容量が 400kHz に適合することを確認する。
-抵抗がない場合は、SDA / SCL それぞれに 3.3V への外付けプルアップを用意する。
+Conta には SDA / SCL それぞれに 10kΩ（R2 / R1）がある。10kΩ だけで 400kHz の動作を保証しない。
+例えば OLED 側に各 4.7kΩ があれば合成値は各約 3.2kΩ となる。実装抵抗と配線容量に応じて外付け抵抗を選び、信号の立ち上がりを実測する。
 抵抗の選定は [ESP-IDF I²C ガイド](https://docs.espressif.com/projects/esp-idf/en/v6.0.3/esp32s3/api-reference/peripherals/i2c.html) に従い、内部プルアップだけに依存しない。
 カメラ・Wi-Fi・測距・OLED 全点灯の同時動作時に、3V3 電源の余裕と電圧低下を実測する。
 
@@ -396,7 +419,7 @@ python3 tools/setup.py --registration
 
 スクリプトは作成前に確認し、`config.json` だけを権限 `0600`、ディレクトリを `0700` で配置する。
 既存の `edge/local/` は変更しない。生成済みの登録管理設定と DB は検証して再利用する。
-その後に Rust 1.99.0 でエッジをビルド・起動し、登録 DB の CA・名前を使って HTTPS の準備完了を確認する。
+その後に Rust 1.99.1 でエッジをビルド・起動し、登録 DB の CA・名前を使って HTTPS の準備完了を確認する。
 スクリプトは Ctrl-C までエッジを動作させる。失敗・中断時は、起動したエッジを停止して設定・DB を保持する。
 IP アドレス、Wi-Fi、ベッド ID、機器別キーは、この設定作成では入力しない。
 機器登録を行う商品用の画面と USB 統合が未完了のため、設定の作成やエッジの起動を「接続完了」とは扱わない。
