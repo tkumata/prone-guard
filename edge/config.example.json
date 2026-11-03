@@ -1,0 +1,18 @@
+{
+  "listen": "0.0.0.0:8443",
+  "database": "edge/local/sensors.sqlite",
+  "tls_certificate": "edge/local/edge.pem",
+  "tls_private_key": "edge/local/edge-key.pem",
+  "retention_seconds": 21600,
+  "devices": [
+    {
+      "bed_id": "bed-01",
+      "token_sha256": "REPLACE_WITH_SHA256_OF_THE_64_CHARACTER_DEVICE_TOKEN",
+      "installation": {
+        "camera_view": "REPLACE_WITH_MEASURED_MOUNTING_DIRECTION",
+        "depth_map_order": "VL53L5CX ULD row order; verify direction on the actual installation",
+        "empty_bed_distance_mm": null
+      }
+    }
+  ]
+}
