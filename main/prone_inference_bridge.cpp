@@ -7,7 +7,6 @@
 #include "dl_image_process.hpp"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
-#include "esp_timer.h"
 #include "human_face_detect.hpp"
 
 static const char *TAG = "prone_inference";
@@ -19,7 +18,6 @@ static constexpr float FACE_DETECTED_SCORE_TH = 0.35f;
 
 static human_face_detect::MSRMNP *s_detector;
 static prone_inference_status_t s_status = PRONE_INFERENCE_STATUS_NOT_READY;
-static int64_t s_last_decode_log_ms;
 static prone_face_box_t s_last_face_box = {
     .x0 = -1,
     .y0 = -1,
@@ -151,20 +149,6 @@ esp_err_t prone_inference_run_jpeg(const uint8_t *jpeg_data, size_t jpeg_len, bo
     } else {
         memset(s_last_face_box.landmarks, 0, sizeof(s_last_face_box.landmarks));
         s_last_face_box.landmarks_valid = false;
-    }
-
-    int64_t now_ms = esp_timer_get_time() / 1000;
-    if (now_ms - s_last_decode_log_ms >= 1000) {
-        s_last_decode_log_ms = now_ms;
-        ESP_LOGI(TAG,
-                 "cascade decode: candidates=%d best=%.3f detected=%d box=[%d,%d,%d,%d]",
-                 (int)result.size(),
-                 (double)best,
-                 (*is_face_detected) ? 1 : 0,
-                 best_x0,
-                 best_y0,
-                 best_x1,
-                 best_y1);
     }
 
     heap_caps_free(rgb.data);
