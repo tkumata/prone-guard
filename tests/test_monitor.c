@@ -90,6 +90,35 @@ int main(int argc, char **argv)
     assert(!strcmp(updated.device_key, current.device_key));
     assert(!strcmp(updated.bed_id, "bed-02"));
     assert(!strcmp(current.bed_id, "bed-01"));
+    assert(updated.tft_mirror_x == 0);
+    current.tft_mirror_x = 1;
+    assert(monitor_settings_decode(update, &current, &updated) == ESP_OK);
+    assert(updated.tft_mirror_x == 1);
+    for (unsigned mirror = 0; mirror <= 1; ++mirror)
+    {
+        cJSON *request = cJSON_Parse(update);
+        assert(request && cJSON_AddBoolToObject(request, "tft_mirror_x", mirror));
+        char *body = cJSON_PrintUnformatted(request);
+        assert(body && monitor_settings_decode(body, &current, &updated) == ESP_OK);
+        assert(updated.tft_mirror_x == mirror && current.tft_mirror_x == 1);
+        cJSON_free(body);
+        cJSON_Delete(request);
+    }
+    const char *bad_mirrors[] = {"\"true\"", "0", "1", "null", "[]", "{}",
+                                "true,\"tft_mirror_x\":false"};
+    for (size_t i = 0; i < sizeof(bad_mirrors) / sizeof(bad_mirrors[0]); ++i)
+    {
+        char body[512];
+        snprintf(body, sizeof(body), "%.*s,\"tft_mirror_x\":%s}",
+                 (int)strlen(update) - 1, update, bad_mirrors[i]);
+        assert(monitor_settings_decode(body, &current, &updated) == ESP_ERR_INVALID_ARG);
+        assert(current.tft_mirror_x == 1);
+    }
+    monitor_settings_t empty = {0};
+    const char *provision = "{\"wifi_ssid\":\"network\",\"wifi_password\":\"password\","
+                            "\"bed_id\":\"bed-01\",\"destination_url\":\"\",\"device_key\":\"\"}";
+    assert(monitor_settings_decode(provision, &empty, &updated) == ESP_OK);
+    assert(updated.tft_mirror_x == 0);
     const char *clear = "{\"wifi_ssid\":\"test-network\",\"wifi_password\":\"\",\"bed_id\":\"\","
                         "\"destination_url\":\"\",\"device_key\":\"\",\"clear_device_key\":true}";
     assert(monitor_settings_decode(clear, &current, &updated) == ESP_OK);

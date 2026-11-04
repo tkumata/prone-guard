@@ -39,7 +39,7 @@ static bool text_pixel(const char *text, int x, int y)
     return letter && ((glyphs[letter - letters][column] >> ((y - 1) / 2)) & 1);
 }
 
-void depth_map_render_strip(const depth_map_t *map, int64_t now_us, int first_y,
+void depth_map_render_strip(const depth_map_t *map, int64_t now_us, bool mirror_x, int first_y,
                             uint8_t pixels[DEPTH_MAP_STRIP_BYTES])
 {
     assert(map && pixels && first_y >= 0 && first_y <= DEPTH_MAP_HEIGHT - DEPTH_MAP_STRIP_HEIGHT &&
@@ -68,7 +68,8 @@ void depth_map_render_strip(const depth_map_t *map, int64_t now_us, int first_y,
             }
             else if (show_map)
             {
-                int cell = (y / 16) * 8 + x / 16;
+                int col = x / 16;
+                int cell = (y / 16) * 8 + (mirror_x ? 7 - col : col);
                 if (valid_cell(map, cell))
                 {
                     uint8_t level = ((4000 - map->distance[cell]) * 63 + 2000) / 4000;

@@ -14,6 +14,7 @@ typedef struct
     char bed_id[MONITOR_ID_MAX + 1];
     char destination_url[MONITOR_URL_MAX + 1];
     char device_key[MONITOR_TOKEN_LEN + 1];
+    uint8_t tft_mirror_x; // Store 0/1 so invalid NVS bytes can be rejected.
 } monitor_settings_t;
 
 typedef struct

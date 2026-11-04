@@ -135,6 +135,7 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
     bool ok = cJSON_AddStringToObject(json, "wifi_ssid", settings.wifi_ssid) &&
               cJSON_AddStringToObject(json, "bed_id", settings.bed_id) &&
               cJSON_AddStringToObject(json, "destination_url", settings.destination_url) &&
+              cJSON_AddBoolToObject(json, "tft_mirror_x", settings.tft_mirror_x) &&
               cJSON_AddBoolToObject(json, "key_configured", settings.device_key[0] != 0) &&
               cJSON_AddBoolToObject(json, "restart_required",
                                     strcmp(settings.wifi_ssid, active_ssid) != 0 ||
@@ -452,11 +453,12 @@ static void tft_task(void *arg)
                 depth_map_t map;
                 xSemaphoreTake(state_mutex, portMAX_DELAY);
                 map = depth_map;
+                bool mirror_x = settings.tft_mirror_x;
                 xSemaphoreGive(state_mutex);
                 int64_t rendered_us = esp_timer_get_time();
                 for (int y = 0; y < DEPTH_MAP_HEIGHT && err == ESP_OK; y += DEPTH_MAP_STRIP_HEIGHT)
                 {
-                    depth_map_render_strip(&map, rendered_us, y, pixels);
+                    depth_map_render_strip(&map, rendered_us, mirror_x, y, pixels);
                     err = tft_display_write_strip(y, pixels);
                 }
             }

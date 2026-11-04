@@ -16,5 +16,5 @@ typedef struct
     uint8_t target_status[64];
 } depth_map_t;
 
-void depth_map_render_strip(const depth_map_t *map, int64_t now_us, int first_y,
+void depth_map_render_strip(const depth_map_t *map, int64_t now_us, bool mirror_x, int first_y,
                             uint8_t pixels[DEPTH_MAP_STRIP_BYTES]);

@@ -1,6 +1,10 @@
 #include "monitor_settings.h"
 #include "nvs.h"
+#include <stddef.h>
 #include <string.h>
+
+_Static_assert(offsetof(monitor_settings_t, tft_mirror_x) == 741,
+               "Keep the legacy settings blob layout unchanged");
 
 esp_err_t monitor_settings_load(monitor_settings_t *settings)
 {
@@ -8,13 +12,17 @@ esp_err_t monitor_settings_load(monitor_settings_t *settings)
     esp_err_t err = nvs_open_from_partition("secure_nvs", "prone_guard", NVS_READONLY, &handle);
     if (err != ESP_OK)
         return err;
-    size_t size = sizeof(*settings);
-    err = nvs_get_blob(handle, "edge_settings", settings, &size);
+    monitor_settings_t loaded = {0};
+    size_t size = sizeof(loaded);
+    err = nvs_get_blob(handle, "edge_settings", &loaded, &size);
     nvs_close(handle);
     if (err != ESP_OK)
         return err;
-    return size == sizeof(*settings) && monitor_settings_valid(settings) ? ESP_OK
-                                                                         : ESP_ERR_INVALID_STATE;
+    if ((size != offsetof(monitor_settings_t, tft_mirror_x) && size != sizeof(loaded)) ||
+        !monitor_settings_valid(&loaded))
+        return ESP_ERR_INVALID_STATE;
+    *settings = loaded;
+    return ESP_OK;
 }
 
 esp_err_t monitor_settings_save(const monitor_settings_t *settings)
