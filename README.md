@@ -91,6 +91,36 @@ export PATH="$(brew --prefix openssl@3)/bin:$PATH"
 openssl version
 ```
 
+#### VS Code を使用する場合
+
+VS Code に ESP-IDF 拡張（`espressif.esp-idf-extension`）と rust-analyzer（`rust-lang.rust-analyzer`）を導入し、リポジトリのルートフォルダを開きます。
+コマンドパレットの `Preferences: Open Workspace Settings (JSON)` から、`.vscode/settings.json` に次を設定してください。
+既に設定がある場合は、既存の項目を残して追加します。
+
+```json
+{
+  "rust-analyzer.linkedProjects": ["./edge/Cargo.toml"],
+  "rust-analyzer.server.extraEnv": {
+    "RUSTUP_TOOLCHAIN": "stable"
+  },
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32s3"
+  },
+  "idf.flashType": "UART",
+  "idf.currentSetup": "/path/to/.espressif/v6.0.3/esp-idf",
+  "idf.extensionActivationMode": "detect"
+}
+```
+
+コマンドパレットで `ESP-IDF: Select Current ESP-IDF Version` を実行し、ESP-IDF **6.0.3** を選択します。
+第 2 節の配線・USB 接続後に、`ESP-IDF: Select Port to Use (COM, tty, usbserial)` でボードのポートを選択してください。
+ボード検出に拡張を使用するため、`idf.extensionActivationMode` は `detect` のままにします。
+
+拡張は SDK の絶対パスを `idf.currentSetup` に保存します。
+個人のパスやポートを共有しないため、`.vscode/settings.json` は Git の追跡対象から除外しています。
+設定は各環境で管理し、`git add -f` で追跡対象に戻さないでください。
+既存の clone で本変更を取り込む場合は、更新前に設定ファイルをリポジトリ外へ退避し、更新後に戻してください。
+
 ### 2. 配線して USB 接続する
 
 電源と USB を外し、実際の端子表記を確認してから、マイコンと深度センサーを配線します。
