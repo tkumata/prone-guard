@@ -62,7 +62,8 @@ bool monitor_destination_parse(const char *url, monitor_destination_t *destinati
 
 bool monitor_settings_valid(const monitor_settings_t *settings)
 {
-    if (!memchr(settings->wifi_ssid, 0, sizeof(settings->wifi_ssid)) ||
+    if (settings->tft_mirror_x > 1 ||
+        !memchr(settings->wifi_ssid, 0, sizeof(settings->wifi_ssid)) ||
         !memchr(settings->wifi_password, 0, sizeof(settings->wifi_password)) ||
         !memchr(settings->bed_id, 0, sizeof(settings->bed_id)) ||
         !memchr(settings->destination_url, 0, sizeof(settings->destination_url)) ||
@@ -114,7 +115,8 @@ esp_err_t monitor_settings_decode(const char *json, const monitor_settings_t *cu
     {
         bool known = false;
         const char *names[] = {"wifi_ssid",       "wifi_password", "bed_id",
-                               "destination_url", "device_key",    "clear_device_key"};
+                               "destination_url", "device_key",    "clear_device_key",
+                               "tft_mirror_x"};
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
             if (!strcmp(item->string, names[i]))
                 known = true;
@@ -129,7 +131,8 @@ esp_err_t monitor_settings_decode(const char *json, const monitor_settings_t *cu
     }
     *updated = *current;
     const cJSON *clear = cJSON_GetObjectItemCaseSensitive(root, "clear_device_key");
-    bool valid = (!clear || cJSON_IsBool(clear)) &&
+    const cJSON *mirror = cJSON_GetObjectItemCaseSensitive(root, "tft_mirror_x");
+    bool valid = (!mirror || cJSON_IsBool(mirror)) && (!clear || cJSON_IsBool(clear)) &&
                  field(root, "wifi_ssid", updated->wifi_ssid, sizeof(updated->wifi_ssid), false) &&
                  field(root, "wifi_password", updated->wifi_password,
                        sizeof(updated->wifi_password), true) &&
@@ -139,6 +142,8 @@ esp_err_t monitor_settings_decode(const char *json, const monitor_settings_t *cu
                  field(root, "device_key", updated->device_key, sizeof(updated->device_key), true);
     if (cJSON_IsTrue(clear))
         updated->device_key[0] = 0;
+    if (mirror)
+        updated->tft_mirror_x = cJSON_IsTrue(mirror);
     valid = valid && monitor_settings_valid(updated);
     cJSON_Delete(root);
     return valid ? ESP_OK : ESP_ERR_INVALID_ARG;

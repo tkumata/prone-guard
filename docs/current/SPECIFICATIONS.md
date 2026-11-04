@@ -139,7 +139,7 @@ HTTPS と HTTP Basic 認証を使用する。
 
 - `GET /`: 設定フォームと取得・送信状態。
 - `GET /health`: Wi-Fi、時刻、カメラ、深度、送信の状態。
-- `GET /settings`: SSID、ベッド ID、URL、キー設定済みか否か。
+- `GET /settings`: SSID、ベッド ID、URL、左右反転、キー設定済みか否か。
 - `POST /settings`: 管理設定を検証して保存する。
 
 POST は同一 Origin と `application/json` を要求する。
@@ -153,7 +153,8 @@ POST は同一 Origin と `application/json` を要求する。
   "bed_id": "bed-01",
   "destination_url": "https://edge.example:8443/v1/measurements",
   "device_key": "",
-  "clear_device_key": false
+  "clear_device_key": false,
+  "tft_mirror_x": false
 }
 ```
 
@@ -167,6 +168,13 @@ Wi-Fi パスワードとキーの空欄は保存済みの値を維持する。
 `clear_device_key:true` はキーを削除する。
 秘密を削除した場合は、新しい送信を停止する。
 Wi-Fi 設定は再起動後に反映する。
+`tft_mirror_x` は TFT の深度マップだけに適用する。
+左右反転は既定で `false` とする。
+左右反転の保存成功後は、再起動せず次回の表示更新で反映する。
+`GET /settings` は保存済みの左右反転を JSON boolean で返す。
+POST で左右反転を省略した場合は現在値を維持する。
+USB 初期設定で左右反転を省略した場合は `false` とする。
+左右反転に boolean 以外の型や重複キーを指定した場合は `400` とする。
 取得 API は Wi-Fi パスワードとキーを返さない。
 
 保存不正は `400`、認証不正は `401`、Origin 不正は `403` とする。
@@ -195,6 +203,10 @@ DB 本体を約 48MB に制限し、rollback journal の余裕を確保する。
 削除失敗をログへ記録する。
 
 マイコンでは、暗号化 `secure_nvs` に管理設定と TLS 情報を保存する。
+左右反転項目のない旧管理設定も、既存項目を保持して読み込む。
+旧形式では左右反転だけを `false` とし、次回の保存で新形式へ更新する。
+既知の旧形式以外のサイズや不正な値は、読込みエラーとする。
+読込みエラーを理由に NVS を自動消去しない。
 HMAC キーは事前設定済みの eFuse KEY0 を既定として使用する。
 別のブロックを使う場合は `CONFIG_NVS_SEC_HMAC_EFUSE_KEY_ID` を変更する。
 商品向けは USB の Security 2 セッション内で、登録世代と取引 ID を含む設定を検証して保存する。
@@ -231,10 +243,16 @@ USB フレーム最大 32KiB、復号後の設定最大 16KiB とし、認証前
 
 - MUST: 左上を原点 `(0,0)` とする。
 - MUST: `x=0..127, y=0..127` に 128×128px のマップを表示する。
-- MUST: `[row][col]` を `(col×16, row×16)` の 16×16px に対応させる。
+- MUST: 反転無効時は `[row][col]` を `(col×16, row×16)` に配置する。
+- MUST: 反転有効時は `[row][col]` を `((7-col)×16, row×16)` に配置する。
+- MUST: 各ゾーンの描画範囲は 16×16px とする。
 - MUST: 全 64 ゾーンを罫線なしで表示する。
-- MUST: ULD の配列順序を維持し、補間、平滑化、回転、反転を加えない。
+- MUST: 観測と送信には ULD の配列順序を維持する。
+- MUST: 描画時だけ、左右反転設定に従って距離と status の参照列を変える。
+- MUST: 補間、平滑化、回転、上下反転は加えない。
+- MUST: 状態文字と凡例は左右反転しない。
 - MUST: 最新の距離、status、取得時刻を同じスナップショットから読む。
+- MUST: フレームごとに反転設定をコピーし、全区画で同じ値を使用する。
 - MUST: 1 秒周期で更新し、表示のために再測距しない。
 - MUST: `y=128..143` に状態、`y=144..159` に凡例を表示する。
 - MUST: 文字セルは 8×16px、各行は最大 16 文字とする。

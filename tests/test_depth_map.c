@@ -10,14 +10,14 @@ static const uint8_t *pixel(int x, int y)
     return frame + (y * DEPTH_MAP_WIDTH + x) * 3;
 }
 
-static void render(const depth_map_t *map, int64_t now)
+static void render(const depth_map_t *map, int64_t now, bool mirror_x)
 {
     depth_map_t before = *map;
     uint8_t guarded[DEPTH_MAP_STRIP_BYTES + 2];
     for (int y = 0; y < DEPTH_MAP_HEIGHT; y += DEPTH_MAP_STRIP_HEIGHT)
     {
         memset(guarded, 0xa5, sizeof(guarded));
-        depth_map_render_strip(map, now, y, guarded + 1);
+        depth_map_render_strip(map, now, mirror_x, y, guarded + 1);
         assert(guarded[0] == 0xa5 && guarded[sizeof(guarded) - 1] == 0xa5);
         memcpy(frame + y * DEPTH_MAP_WIDTH * 3, guarded + 1, DEPTH_MAP_STRIP_BYTES);
     }
@@ -75,7 +75,7 @@ int main(void)
 {
     depth_map_t map = {0};
     static uint8_t labels[5][DEPTH_MAP_STRIP_BYTES], legend[DEPTH_MAP_STRIP_BYTES];
-    render(&map, 9000000);
+    render(&map, 9000000, false);
     blank_map();
     text_layout(128, "NO DATA");
     text_layout(144, "0-4m NEAR=WHITE");
@@ -90,7 +90,7 @@ int main(void)
         int distance = 4000 - (level * 4000 + 31) / 63;
         for (int cell = 0; cell < 64; ++cell)
             map.distance[cell] = distance;
-        render(&map, 10000000);
+        render(&map, 10000000, false);
         for (int cell = 0; cell < 64; ++cell)
             cell_color(cell, level << 2);
         text_layout(128, "DEPTH");
@@ -103,36 +103,36 @@ int main(void)
     for (int cell = 0; cell < 64; ++cell)
     {
         map.distance[cell] = 0;
-        render(&map, 10000000);
+        render(&map, 10000000, false);
         for (int other = 0; other < 64; ++other)
             cell_color(other, other == cell ? 0xfc : 0);
         map.distance[cell] = 4000;
     }
     map.distance[0] = 2000;
-    render(&map, 10000000);
+    render(&map, 10000000, false);
     cell_color(0, 32 << 2);
     map.distance[0] = 2001;
-    render(&map, 10000000);
+    render(&map, 10000000, false);
     cell_color(0, 31 << 2);
 
     const uint8_t invalid_statuses[] = {0, 6, 9, 255};
     for (unsigned i = 0; i < sizeof(invalid_statuses); ++i)
     {
         map.target_status[63] = invalid_statuses[i];
-        render(&map, 10000000);
+        render(&map, 10000000, false);
         cross(63);
         cell_color(62, 0);
     }
     map.target_status[63] = 5;
     map.distance[63] = -1;
-    render(&map, 10000000);
+    render(&map, 10000000, false);
     cross(63);
     map.distance[63] = 4001;
-    render(&map, 10000000);
+    render(&map, 10000000, false);
     cross(63);
 
     memset(map.target_status, 255, sizeof(map.target_status));
-    render(&map, 10000000);
+    render(&map, 10000000, false);
     for (int cell = 0; cell < 64; ++cell)
         cross(cell);
     text_layout(128, "NO VALID");
@@ -140,33 +140,53 @@ int main(void)
 
     memset(map.target_status, 5, sizeof(map.target_status));
     map.distance[0] = 0;
-    render(&map, 15000000);
+    render(&map, 15000000, false);
     cell_color(0, 0xfc);
     assert(!memcmp(labels[1], pixel(0, 128), sizeof(labels[1])));
-    render(&map, 15000001);
+    render(&map, 15000001, false);
     blank_map();
     text_layout(128, "STALE");
     memcpy(labels[3], pixel(0, 128), sizeof(labels[3]));
     map.error = true;
-    render(&map, 15000001);
+    render(&map, 15000001, false);
     blank_map();
     text_layout(128, "ERROR");
     memcpy(labels[4], pixel(0, 128), sizeof(labels[4]));
     map.available = false;
-    render(&map, 15000001);
+    render(&map, 15000001, false);
     assert(!memcmp(labels[4], pixel(0, 128), sizeof(labels[4])));
     map.error = false;
-    render(&map, 15000001);
+    render(&map, 15000001, false);
     assert(!memcmp(labels[0], pixel(0, 128), sizeof(labels[0])));
     map.available = true;
     map.acquired_us = 15000001;
-    render(&map, 15000001);
+    render(&map, 15000001, false);
     cell_color(0, 0xfc);
     assert(!memcmp(labels[1], pixel(0, 128), sizeof(labels[1])));
     assert(!memcmp(legend, pixel(0, 144), sizeof(legend)));
     for (int a = 0; a < 5; ++a)
         for (int b = 0; b < a; ++b)
             assert(memcmp(labels[a], labels[b], sizeof(labels[a])));
+    static uint8_t original[sizeof(frame)];
+    for (int state = 0; state < 5; ++state)
+    {
+        map.available = state != 0;
+        map.error = state == 4;
+        map.acquired_us = state == 3 ? 0 : 15000001;
+        for (int cell = 0; cell < 64; ++cell)
+        {
+            map.distance[cell] = 4000 - (cell * 4000 + 31) / 63;
+            map.target_status[cell] = state == 2 || cell % 7 == 0 ? 255 : 5;
+        }
+        render(&map, 15000001, false);
+        memcpy(original, frame, sizeof(frame));
+        render(&map, 15000001, true);
+        for (int y = 0; y < 128; ++y)
+            for (int x = 0; x < 128; ++x)
+                assert(!memcmp(pixel(x, y), original + (y * 128 + 127 - x) * 3, 3));
+        assert(!memcmp(pixel(0, 128), original + 128 * 128 * 3,
+                       2 * DEPTH_MAP_STRIP_BYTES));
+    }
     puts("Depth map layout, RGB666 grayscale, text and state transition tests "
          "passed");
 }
