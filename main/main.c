@@ -19,9 +19,9 @@
 #include "freertos/task.h"
 #include "mbedtls/platform_util.h"
 #include "monitor_settings.h"
-#include "oled_display.h"
 #include "prone_inference_bridge.h"
 #include "telemetry.h"
+#include "tft_display.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -30,7 +30,7 @@
 #include <time.h>
 
 #if !defined(CONFIG_SCCB_HARDWARE_I2C_DRIVER_NEW) || !defined(CONFIG_SCCB_HARDWARE_I2C_PORT0)
-#error "Select the new SCCB I2C driver on I2C0 in menuconfig; I2C1 is reserved for depth/OLED."
+#error "Select the new SCCB I2C driver on I2C0 in menuconfig; I2C1 is reserved for depth."
 #endif
 
 static const char *TAG = "prone_guard";
@@ -434,32 +434,36 @@ static void sensor_task(void *arg)
     }
 }
 
-static void oled_task(void *arg)
+static void tft_task(void *arg)
 {
-    i2c_master_dev_handle_t device = arg;
+    (void)arg;
     bool ready = false;
     int64_t next_init = 0;
-    uint8_t frame[DEPTH_MAP_FRAME_BYTES];
+    static uint8_t pixels[DEPTH_MAP_STRIP_BYTES];
     TickType_t tick = xTaskGetTickCount();
     while (true)
     {
         int64_t now = esp_timer_get_time();
         if (ready || now >= next_init)
         {
-            esp_err_t err = ready ? ESP_OK : oled_display_init(device);
+            esp_err_t err = ready ? ESP_OK : tft_display_init();
             if (err == ESP_OK)
             {
                 depth_map_t map;
                 xSemaphoreTake(state_mutex, portMAX_DELAY);
                 map = depth_map;
                 xSemaphoreGive(state_mutex);
-                depth_map_render(&map, esp_timer_get_time(), frame);
-                err = oled_display_write(device, frame);
+                int64_t rendered_us = esp_timer_get_time();
+                for (int y = 0; y < DEPTH_MAP_HEIGHT && err == ESP_OK; y += DEPTH_MAP_STRIP_HEIGHT)
+                {
+                    depth_map_render_strip(&map, rendered_us, y, pixels);
+                    err = tft_display_write_strip(y, pixels);
+                }
             }
             ready = err == ESP_OK;
             if (!ready)
             {
-                ESP_LOGW(TAG, "OLED update failed: %s", esp_err_to_name(err));
+                ESP_LOGW(TAG, "TFT update failed: %s", esp_err_to_name(err));
                 next_init = esp_timer_get_time() + 5000000;
             }
         }
@@ -515,7 +519,7 @@ static void sender_task(void *arg)
     }
 }
 
-static void init_sensor_devices(i2c_master_dev_handle_t *depth, i2c_master_dev_handle_t *oled)
+static void init_depth_device(i2c_master_dev_handle_t *depth)
 {
     i2c_master_bus_handle_t bus;
     const i2c_master_bus_config_t bus_config = {
@@ -535,10 +539,6 @@ static void init_sensor_devices(i2c_master_dev_handle_t *depth, i2c_master_dev_h
     err = i2c_master_bus_add_device(bus, &config, depth);
     if (err != ESP_OK)
         ESP_LOGE(TAG, "depth I2C registration failed: %s", esp_err_to_name(err));
-    config.device_address = 0x3c;
-    err = i2c_master_bus_add_device(bus, &config, oled);
-    if (err != ESP_OK)
-        ESP_LOGE(TAG, "OLED I2C registration failed: %s", esp_err_to_name(err));
 }
 
 void app_main(void)
@@ -593,8 +593,8 @@ void app_main(void)
     esp_sntp_set_time_sync_notification_cb(synchronized);
     esp_sntp_init();
     ESP_ERROR_CHECK(start_management_server());
-    i2c_master_dev_handle_t depth_device = NULL, oled_device = NULL;
-    init_sensor_devices(&depth_device, &oled_device);
+    i2c_master_dev_handle_t depth_device = NULL;
+    init_depth_device(&depth_device);
     depth_map.error = !depth_device;
     ESP_ERROR_CHECK(
         xTaskCreate(sensor_task, "sensors", 16384, depth_device, tskIDLE_PRIORITY + 1, NULL) == pdPASS
@@ -604,7 +604,6 @@ void app_main(void)
         xTaskCreate(sender_task, "edge_sender", 12288, NULL, tskIDLE_PRIORITY + 1, NULL) == pdPASS
             ? ESP_OK
             : ESP_ERR_NO_MEM);
-    if (oled_device &&
-        xTaskCreate(oled_task, "oled", 4096, oled_device, tskIDLE_PRIORITY + 1, NULL) != pdPASS)
-        ESP_LOGE(TAG, "OLED task allocation failed");
+    if (xTaskCreate(tft_task, "tft", 4096, NULL, tskIDLE_PRIORITY + 1, NULL) != pdPASS)
+        ESP_LOGE(TAG, "TFT task allocation failed");
 }

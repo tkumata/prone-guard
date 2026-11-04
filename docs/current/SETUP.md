@@ -187,36 +187,59 @@ Conta は測距中に約 100mA を使用するため、電源の余裕を実測�
 ピン割当の根拠は [Freenove 公式ピン配置](https://github.com/Freenove/Freenove_ESP32_S3_WROOM_Board/blob/main/ESP32S3_Pinout.png)、[Conta 製品資料](https://www.switch-science.com/products/10281)、[Conta 回路図](https://doc.switch-science.com/media/files/19d73541-d39a-4e3c-bf7a-69a2a56af50a.pdf) による。
 GPIO14 / GPIO21 / GPIO47 は同ピン配置でカメラ、PSRAM（GPIO35〜37）、SD（GPIO38〜40）、USB（GPIO19 / GPIO20）、RGB LED（GPIO48）と重複しない。
 
-### 2.2. OLED SSD1306
+Conta には SDA / SCL それぞれに 10kΩ のプルアップがある。
+10kΩ だけで 400kHz の動作を保証しない。
+配線容量に応じて 3.3V への外付け抵抗を選び、立ち上がりを実測する。
+抵抗の選定は [ESP-IDF I²C ガイド](https://docs.espressif.com/projects/esp-idf/en/v6.0.3/esp32s3/api-reference/peripherals/i2c.html) に従う。
+内部プルアップだけに依存せず、5V へプルアップしない。
 
-128×64px、モノクロ、3.3V 電源・3.3V ロジックに対応した 4 ピン I²C モジュールを使用する。
-64×64px のマップを収めるため、128×32px の製品は対象外とする。
-SSD1306 はコントローラ名であり、購入する基板の電源条件・端子順・解像度・アドレスを製品資料で照合する。
-本仕様では 7bit アドレスを `0x3C` とする。`0x3D` の基板は製品の手順で `0x3C` に設定できるものを使用する。
-書込み用 8bit 表記の `0x78` と混同しない。
-既存の [climate-monitor](https://github.com/tkumata/climate-monitor/blob/main/climate-monitor.ino) と同じ 128×64px、`0x3C`、内部チャージポンプを使う構成であり、同リポジトリの [配線表](https://github.com/tkumata/climate-monitor#ssd1306) も VDD=3V3 としている。
-ここでは Freenove の GPIO14 / GPIO21 を使用するため、同配線表の A4 / A5 をそのまま適用しない。
+### 2.2. TFT ST7735
 
-| OLED | Freenove | 接続方法 |
-| ---- | -------- | ------ |
-| VCC / VDD | 3V3 | モジュールの 3.3V 電源入力へ接続する |
-| GND | GND | Conta と共通にする |
-| SDA | GPIO14 | Conta の SDA と並列に接続する |
-| SCL / SCK | GPIO21 | Conta の SCL と並列に接続する |
+1.8-inch、128×160px、18bit の ST7735 モジュールを縦向きで使用する。
+端子は GND / VCC / SCL / SDA / RES / DC / CS / BL とする。
+専用資料がないため、汎用 ST7735 の初期条件で確認する。
+下表は購入モジュールの保証仕様ではない。
+USB と電源を外し、実物の端子名を照合してから配線する。
 
-I2C1、400kHz を共有し、深度センサーの `0x29` と OLED の `0x3C` を別デバイスとして扱う。
-この 4 ピン I²C モジュールでは SPI 用の CS / DC や追加の GPIO は使用しない。
-SDA / SCL のプルアップ先は 3.3V とする。5V へプルアップされる基板をそのまま接続しない。
-両基板の実装済み抵抗を確認し、並列接続後の合成抵抗と配線容量が 400kHz に適合することを確認する。
-Conta には SDA / SCL それぞれに 10kΩ（R2 / R1）がある。10kΩ だけで 400kHz の動作を保証しない。
-例えば OLED 側に各 4.7kΩ があれば合成値は各約 3.2kΩ となる。実装抵抗と配線容量に応じて外付け抵抗を選び、信号の立ち上がりを実測する。
-抵抗の選定は [ESP-IDF I²C ガイド](https://docs.espressif.com/projects/esp-idf/en/v6.0.3/esp32s3/api-reference/peripherals/i2c.html) に従い、内部プルアップだけに依存しない。
-カメラ・Wi-Fi・測距・OLED 全点灯の同時動作時に、3V3 電源の余裕と電圧低下を実測する。
+| TFT | Freenove | 接続方法 |
+| --- | --- | --- |
+| GND | GND | 共通にする |
+| VCC | 3V3 | 3.3V で初期確認する。5V は印加しない |
+| SCL | GPIO1 | SPI SCLK |
+| SDA | GPIO2 | SPI MOSI |
+| RES | GPIO42 | リセット |
+| DC | GPIO41 | コマンドとデータの選択 |
+| CS | GPIO38 | SPI チップ選択 |
+| BL | 3V3 | 330Ω の直列抵抗を介して接続する |
 
-表示は [OLED 深度マップ仕様](SPECIFICATIONS.md#7-oled-深度マップ) に従う。
-現行ファームウェアは OLED 表示と共有バスに対応する。通常の初期設定後、起動時に自動で表示を開始する。
-未接続・転送失敗は `OLED update failed` として記録し、5 秒以上空けて再初期化する。
-実機確認は未実施であり、実装と確認状態は実装計画の Task 12 で管理する。
+SCL / SDA は SPI の信号名であり、深度センサーの I²C と並列接続しない。
+SPI2_HOST、mode 0、8MHz の書込み専用接続を使用する。
+GPIO38 は microSD の CMD と共用のため、カードを挿入しない。
+GPIO2 には基板上 LED があるため、転送で点灯状態が変化する。
+GPIO41 / GPIO42 の外部 JTAG は併用しない。
+カメラ、PSRAM、USB、深度の GPIO は変更しない。
+
+BL は LED の正極または High 有効の制御入力と仮定する。
+GPIO から直接給電せず、初期接続では 330Ω の抵抗を省略しない。
+バックライトの点灯と電流を実測する。
+暗い場合も根拠なく抵抗を短絡しない。
+カメラ・Wi-Fi・測距・バックライトの同時動作で電圧低下を確認する。
+
+初期化はリセット後に 120ms、sleep out 後に 120ms 待機する。
+RGB666、縦向き、BGR、表示反転オフを使用する。
+列オフセットは +2、行オフセットは 0 とする。
+論理上の横 128px をコントローラの RAM 列 2〜129 へ書き込む。
+専用資料がないため、表示位置、向き、色順、反転は実機で確認する。
+不一致がある場合は `main/tft_display.c` のパネル設定を調整する。
+確認前に配線や実際の描画を合格扱いしない。
+
+表示は [TFT 深度マップ仕様](SPECIFICATIONS.md#7-tft-深度マップ) に従う。
+初期設定後、起動時に表示を開始する。
+検出可能な初期化・転送失敗は `TFT update failed` として記録する。
+再初期化は失敗から 5 秒以上空ける。
+SPI の応答確認はなく、未接続でも転送成功になる場合がある。
+SPI の成功ログだけでパネル接続を確認済みにしない。
+実装と検証状態は [表示移行計画](../plans/active/2026-11-04-issue-17-st7735-depth-display.md) で管理する。
 
 ## 3. スクリプト内の証明書・設定生成
 
@@ -405,8 +428,9 @@ python3 -m unittest discover -s tests -p 'test_edge_https.py'
 別の ESP-IDF ビルド先を使う場合は、IDF_BUILD_DIR を指定する。
 実機で、毎秒の受信、再接続、再起動後の NVS 復元を確認する。
 64 セルの順序と、カメラ・深度の時間差も確認する。
-OLED では、各セルの 8×8px 対応、0〜4000mm の濃淡、無効セル、取得エラー、更新停止からの復帰を確認する。
-同時接続で測距・送信周期を保てること、OLED 未接続・転送失敗の記録と取得・送信の継続、全点灯時の電源も実機で確認する。
+TFT では、各セルの 16×16px 対応、64 階調、文字 2 行、無効セル、取得エラー、更新停止からの復帰を確認する。
+同時接続で測距・送信周期を保てること、転送失敗の記録と取得・送信の継続を確認する。
+TFT 未接続時の取得・送信継続、バックライト点灯時の電源も実機で確認する。
 Jev の 180 秒入力、30 秒期限、姿勢ごとの識別能力は別に検証する。
 合成データのテスト成功を、姿勢識別精度の確認として扱わない。
 

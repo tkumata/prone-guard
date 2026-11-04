@@ -5,11 +5,11 @@
   "rust-analyzer.server.extraEnv": {
     "RUSTUP_TOOLCHAIN": "stable"
   },
-  "idf.port": "/dev/tty.usbmodem5AB90112901",
+  "idf.port": "/dev/tty.usbmodem13201",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
   },
   "idf.flashType": "UART",
-  "idf.currentSetup": "${env:HOME}/.espressif/v6.0.3/esp-idf",
-  "idf.extensionActivationMode": "never"
+  "idf.currentSetup": "/Users/kumata/.espressif/v6.0.3/esp-idf",
+  "idf.extensionActivationMode": "detect"
 }
