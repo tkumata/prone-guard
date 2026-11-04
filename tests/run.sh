@@ -20,5 +20,5 @@ cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Imain \
 cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
   -Itests/fakes -Imain -I"${IDF_BUILD_DIR:-build}/config" \
   -I"$IDF_PATH/components/esp_common/include" \
-  main/oled_display.c tests/test_oled_display.c -o "$test_binary"
+  main/tft_display.c tests/test_tft_display.c -o "$test_binary"
 "$test_binary"

@@ -3,124 +3,170 @@
 #include <stdio.h>
 #include <string.h>
 
-static bool pixel(const uint8_t *frame, int x, int y)
+static uint8_t frame[DEPTH_MAP_WIDTH * DEPTH_MAP_HEIGHT * 3];
+
+static const uint8_t *pixel(int x, int y)
 {
-    return (frame[(y / 8) * 128 + x] >> (y % 8)) & 1;
+    return frame + (y * DEPTH_MAP_WIDTH + x) * 3;
 }
 
-static int lit_pixels(const uint8_t *frame, int cell)
+static void render(const depth_map_t *map, int64_t now)
 {
-    int count = 0;
-    for (int y = 0; y < 8; ++y)
-        for (int x = 0; x < 8; ++x)
-            count += pixel(frame, (cell % 8) * 8 + x, (cell / 8) * 8 + y);
-    return count;
+    depth_map_t before = *map;
+    uint8_t guarded[DEPTH_MAP_STRIP_BYTES + 2];
+    for (int y = 0; y < DEPTH_MAP_HEIGHT; y += DEPTH_MAP_STRIP_HEIGHT)
+    {
+        memset(guarded, 0xa5, sizeof(guarded));
+        depth_map_render_strip(map, now, y, guarded + 1);
+        assert(guarded[0] == 0xa5 && guarded[sizeof(guarded) - 1] == 0xa5);
+        memcpy(frame + y * DEPTH_MAP_WIDTH * 3, guarded + 1, DEPTH_MAP_STRIP_BYTES);
+    }
+    assert(!memcmp(map, &before, sizeof(before)));
+    for (size_t i = 0; i < sizeof(frame); ++i)
+        assert((frame[i] & 3) == 0);
 }
 
-static void blank_map(const uint8_t *frame)
+static void cell_color(int cell, uint8_t brightness)
+{
+    for (int y = 0; y < 16; ++y)
+        for (int x = 0; x < 16; ++x)
+        {
+            const uint8_t *p = pixel((cell % 8) * 16 + x, (cell / 8) * 16 + y);
+            assert(p[0] == brightness && p[1] == brightness && p[2] == brightness);
+        }
+}
+
+static void cross(int cell)
+{
+    for (int y = 0; y < 16; ++y)
+        for (int x = 0; x < 16; ++x)
+        {
+            const uint8_t *p = pixel((cell % 8) * 16 + x, (cell / 8) * 16 + y);
+            assert(p[0] == (x == y || x + y == 15 ? 0xfc : 0));
+            assert(p[1] == 0 && p[2] == 0);
+        }
+}
+
+static void blank_map(void)
 {
     for (int cell = 0; cell < 64; ++cell)
-        assert(lit_pixels(frame, cell) == 0);
+        cell_color(cell, 0);
 }
 
-static void cross(const uint8_t *frame, int cell)
+static void text_layout(int first_y, const char *text)
 {
-    for (int y = 0; y < 8; ++y)
-        for (int x = 0; x < 8; ++x)
-            assert(pixel(frame, (cell % 8) * 8 + x, (cell / 8) * 8 + y) == (x == y || x + y == 7));
+    for (int character = 0; character < 16; ++character)
+    {
+        bool lit = false;
+        for (int y = 0; y < 16; ++y)
+            for (int x = 0; x < 8; ++x)
+            {
+                const uint8_t *p = pixel(character * 8 + x, first_y + y);
+                assert(p[0] == p[1] && p[1] == p[2] && (p[0] == 0 || p[0] == 0xfc));
+                if (x == 0 || x >= 6 || y == 0 || y == 15)
+                    assert(p[0] == 0);
+                lit |= p[0] != 0;
+            }
+        assert(lit == ((size_t)character < strlen(text) && text[character] != ' '));
+    }
 }
 
 int main(void)
 {
     depth_map_t map = {0};
-    uint8_t frame[DEPTH_MAP_FRAME_BYTES], no_data[DEPTH_MAP_FRAME_BYTES];
-    memset(frame, 0xff, sizeof(frame));
-    depth_map_render(&map, 9000000, frame);
-    blank_map(frame);
-    assert(frame[68] == 0x7f && frame[69] == 0x02); // N
-    assert(frame[86] == 0x7f && frame[87] == 0x41); // D in NO DATA
-    memcpy(no_data, frame, sizeof(frame));
+    static uint8_t labels[5][DEPTH_MAP_STRIP_BYTES], legend[DEPTH_MAP_STRIP_BYTES];
+    render(&map, 9000000);
+    blank_map();
+    text_layout(128, "NO DATA");
+    text_layout(144, "0-4m NEAR=WHITE");
+    memcpy(labels[0], pixel(0, 128), sizeof(labels[0]));
+    memcpy(legend, pixel(0, 144), sizeof(legend));
 
     map.available = true;
     map.acquired_us = 10000000;
     memset(map.target_status, 5, sizeof(map.target_status));
-    for (int level = 0; level <= 16; ++level)
+    for (int level = 0; level < 64; ++level)
     {
-        for (int i = 0; i < 64; ++i)
-            map.distance[i] = 4000 - level * 250;
-        depth_map_t before = map;
-        depth_map_render(&map, 10000000, frame);
-        assert(!memcmp(&map, &before, sizeof(map)));
+        int distance = 4000 - (level * 4000 + 31) / 63;
         for (int cell = 0; cell < 64; ++cell)
-            assert(lit_pixels(frame, cell) == level * 4);
-        assert(frame[68] == 0x7f && frame[69] == 0x41); // D in DEPTH
+            map.distance[cell] = distance;
+        render(&map, 10000000);
+        for (int cell = 0; cell < 64; ++cell)
+            cell_color(cell, level << 2);
+        text_layout(128, "DEPTH");
+        assert(!memcmp(legend, pixel(0, 144), sizeof(legend)));
     }
+    memcpy(labels[1], pixel(0, 128), sizeof(labels[1]));
 
-    for (int i = 0; i < 64; ++i)
-        map.distance[i] = 4000;
+    for (int cell = 0; cell < 64; ++cell)
+        map.distance[cell] = 4000;
     for (int cell = 0; cell < 64; ++cell)
     {
         map.distance[cell] = 0;
-        depth_map_render(&map, 10000000, frame);
+        render(&map, 10000000);
         for (int other = 0; other < 64; ++other)
-            assert(lit_pixels(frame, other) == (other == cell ? 64 : 0));
+            cell_color(other, other == cell ? 0xfc : 0);
         map.distance[cell] = 4000;
     }
-
     map.distance[0] = 2000;
-    depth_map_render(&map, 10000000, frame);
-    for (int y = 0; y < 8; ++y)
-        for (int x = 0; x < 8; ++x)
-            assert(pixel(frame, x, y) == ((x + y) % 2 == 0));
-    map.distance[0] = 3875; // Halfway between levels 0 and 1 rounds up.
-    depth_map_render(&map, 10000000, frame);
-    assert(lit_pixels(frame, 0) == 4);
-    map.distance[0] = 3876;
-    depth_map_render(&map, 10000000, frame);
-    assert(lit_pixels(frame, 0) == 0);
+    render(&map, 10000000);
+    cell_color(0, 32 << 2);
+    map.distance[0] = 2001;
+    render(&map, 10000000);
+    cell_color(0, 31 << 2);
 
     const uint8_t invalid_statuses[] = {0, 6, 9, 255};
     for (unsigned i = 0; i < sizeof(invalid_statuses); ++i)
     {
         map.target_status[63] = invalid_statuses[i];
-        depth_map_render(&map, 10000000, frame);
-        cross(frame, 63);
+        render(&map, 10000000);
+        cross(63);
+        cell_color(62, 0);
     }
     map.target_status[63] = 5;
     map.distance[63] = -1;
-    depth_map_render(&map, 10000000, frame);
-    cross(frame, 63);
+    render(&map, 10000000);
+    cross(63);
     map.distance[63] = 4001;
-    depth_map_render(&map, 10000000, frame);
-    cross(frame, 63);
+    render(&map, 10000000);
+    cross(63);
 
     memset(map.target_status, 255, sizeof(map.target_status));
-    depth_map_render(&map, 10000000, frame);
+    render(&map, 10000000);
     for (int cell = 0; cell < 64; ++cell)
-        cross(frame, cell);
-    assert(frame[68] == 0x7f && frame[69] == 0x02); // N in NO VALID
-    assert(frame[86] == 0x1f && frame[87] == 0x20); // V
+        cross(cell);
+    text_layout(128, "NO VALID");
+    memcpy(labels[2], pixel(0, 128), sizeof(labels[2]));
 
     memset(map.target_status, 5, sizeof(map.target_status));
     map.distance[0] = 0;
-    depth_map_render(&map, 15000000, frame);
-    assert(lit_pixels(frame, 0) == 64);
-    depth_map_render(&map, 15000001, frame);
-    blank_map(frame);
-    assert(frame[68] == 0x46 && frame[69] == 0x49); // S in STALE
+    render(&map, 15000000);
+    cell_color(0, 0xfc);
+    assert(!memcmp(labels[1], pixel(0, 128), sizeof(labels[1])));
+    render(&map, 15000001);
+    blank_map();
+    text_layout(128, "STALE");
+    memcpy(labels[3], pixel(0, 128), sizeof(labels[3]));
     map.error = true;
-    depth_map_render(&map, 15000001, frame);
-    blank_map(frame);
-    assert(frame[68] == 0x7f && frame[69] == 0x49); // E in ERROR
+    render(&map, 15000001);
+    blank_map();
+    text_layout(128, "ERROR");
+    memcpy(labels[4], pixel(0, 128), sizeof(labels[4]));
     map.available = false;
-    depth_map_render(&map, 15000001, frame);
-    assert(frame[68] == 0x7f && frame[69] == 0x49);
-    map.available = true;
+    render(&map, 15000001);
+    assert(!memcmp(labels[4], pixel(0, 128), sizeof(labels[4])));
     map.error = false;
+    render(&map, 15000001);
+    assert(!memcmp(labels[0], pixel(0, 128), sizeof(labels[0])));
+    map.available = true;
     map.acquired_us = 15000001;
-    depth_map_render(&map, 15000001, frame);
-    assert(lit_pixels(frame, 0) == 64);
-    assert(frame[68] == 0x7f && frame[69] == 0x41);
-    assert(memcmp(no_data, frame, sizeof(frame)));
-    puts("Depth map rendering behavior tests passed");
+    render(&map, 15000001);
+    cell_color(0, 0xfc);
+    assert(!memcmp(labels[1], pixel(0, 128), sizeof(labels[1])));
+    assert(!memcmp(legend, pixel(0, 144), sizeof(legend)));
+    for (int a = 0; a < 5; ++a)
+        for (int b = 0; b < a; ++b)
+            assert(memcmp(labels[a], labels[b], sizeof(labels[a])));
+    puts("Depth map layout, RGB666 grayscale, text and state transition tests "
+         "passed");
 }
