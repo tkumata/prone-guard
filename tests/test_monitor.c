@@ -85,21 +85,24 @@ int main(int argc, char **argv)
     const char *update =
         "{\"wifi_ssid\":\"new-network\",\"wifi_password\":\"\",\"bed_id\":\"bed-02\",\"destination_"
         "url\":\"https://edge.example:8443/v1/measurements\",\"device_key\":\"\"}";
-    assert(monitor_settings_decode(update, &current, &updated) == ESP_OK);
+    assert(monitor_settings_decode(update, &current, &updated, NULL) == ESP_OK);
     assert(!strcmp(updated.wifi_password, current.wifi_password));
     assert(!strcmp(updated.device_key, current.device_key));
     assert(!strcmp(updated.bed_id, "bed-02"));
     assert(!strcmp(current.bed_id, "bed-01"));
     assert(updated.tft_mirror_x == 0);
     current.tft_mirror_x = 1;
-    assert(monitor_settings_decode(update, &current, &updated) == ESP_OK);
-    assert(updated.tft_mirror_x == 1);
+    current.face_model = MONITOR_FACE_ESPDET_PICO_416;
+    bool restart = true;
+    assert(monitor_settings_decode(update, &current, &updated, &restart) == ESP_OK);
+    assert(updated.tft_mirror_x == 1 && updated.face_model == MONITOR_FACE_ESPDET_PICO_416);
+    assert(!restart);
     for (unsigned mirror = 0; mirror <= 1; ++mirror)
     {
         cJSON *request = cJSON_Parse(update);
         assert(request && cJSON_AddBoolToObject(request, "tft_mirror_x", mirror));
         char *body = cJSON_PrintUnformatted(request);
-        assert(body && monitor_settings_decode(body, &current, &updated) == ESP_OK);
+        assert(body && monitor_settings_decode(body, &current, &updated, NULL) == ESP_OK);
         assert(updated.tft_mirror_x == mirror && current.tft_mirror_x == 1);
         cJSON_free(body);
         cJSON_Delete(request);
@@ -111,17 +114,41 @@ int main(int argc, char **argv)
         char body[512];
         snprintf(body, sizeof(body), "%.*s,\"tft_mirror_x\":%s}",
                  (int)strlen(update) - 1, update, bad_mirrors[i]);
-        assert(monitor_settings_decode(body, &current, &updated) == ESP_ERR_INVALID_ARG);
+        assert(monitor_settings_decode(body, &current, &updated, NULL) == ESP_ERR_INVALID_ARG);
         assert(current.tft_mirror_x == 1);
+    }
+    char model_request[512];
+    snprintf(model_request, sizeof(model_request),
+             "%.*s,\"face_model\":\"msrmnp\",\"restart_after_save\":true}",
+             (int)strlen(update) - 1, update);
+    assert(monitor_settings_decode(model_request, &current, &updated, &restart) == ESP_OK);
+    assert(updated.face_model == MONITOR_FACE_MSRMNP && restart);
+    assert(monitor_settings_decode(model_request, &current, &updated, NULL) == ESP_ERR_INVALID_ARG);
+    snprintf(model_request, sizeof(model_request),
+             "%.*s,\"face_model\":\"espdet_pico_416\",\"restart_after_save\":false}",
+             (int)strlen(update) - 1, update);
+    assert(monitor_settings_decode(model_request, &current, &updated, &restart) == ESP_OK);
+    assert(updated.face_model == MONITOR_FACE_ESPDET_PICO_416 && !restart);
+    const char *bad_options[] = {"\"face_model\":\"unknown\"", "\"face_model\":1",
+                                 "\"face_model\":\"msrmnp\",\"face_model\":\"espdet_pico_416\"",
+                                 "\"restart_after_save\":\"true\"",
+                                 "\"restart_after_save\":true,\"restart_after_save\":false"};
+    for (size_t i = 0; i < sizeof(bad_options) / sizeof(bad_options[0]); ++i)
+    {
+        snprintf(model_request, sizeof(model_request), "%.*s,%s}",
+                 (int)strlen(update) - 1, update, bad_options[i]);
+        assert(monitor_settings_decode(model_request, &current, &updated, &restart) ==
+               ESP_ERR_INVALID_ARG);
+        assert(!restart);
     }
     monitor_settings_t empty = {0};
     const char *provision = "{\"wifi_ssid\":\"network\",\"wifi_password\":\"password\","
                             "\"bed_id\":\"bed-01\",\"destination_url\":\"\",\"device_key\":\"\"}";
-    assert(monitor_settings_decode(provision, &empty, &updated) == ESP_OK);
-    assert(updated.tft_mirror_x == 0);
+    assert(monitor_settings_decode(provision, &empty, &updated, NULL) == ESP_OK);
+    assert(updated.tft_mirror_x == 0 && updated.face_model == MONITOR_FACE_MSRMNP);
     const char *clear = "{\"wifi_ssid\":\"test-network\",\"wifi_password\":\"\",\"bed_id\":\"\","
                         "\"destination_url\":\"\",\"device_key\":\"\",\"clear_device_key\":true}";
-    assert(monitor_settings_decode(clear, &current, &updated) == ESP_OK);
+    assert(monitor_settings_decode(clear, &current, &updated, NULL) == ESP_OK);
     assert(!monitor_settings_ready(&updated));
     assert(!updated.device_key[0]);
     const char *invalid[] = {"http://edge.example/v1/measurements",
@@ -136,6 +163,6 @@ int main(int argc, char **argv)
         strcpy(updated.destination_url, invalid[i]);
         assert(!monitor_settings_valid(&updated));
     }
-    assert(monitor_settings_decode("{\"mode\":\"jev\"}", &current, &updated) != ESP_OK);
+    assert(monitor_settings_decode("{\"mode\":\"jev\"}", &current, &updated, NULL) != ESP_OK);
     puts("Settings and telemetry behavior tests passed");
 }

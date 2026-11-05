@@ -15,6 +15,7 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/idf_additions.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "mbedtls/platform_util.h"
@@ -37,6 +38,7 @@ static const char *TAG = "prone_guard";
 static SemaphoreHandle_t state_mutex;
 static monitor_settings_t settings;
 static char active_ssid[33], active_password[65];
+static uint8_t active_face_model;
 static device_security_t security;
 static sensor_observation_t latest;
 static depth_map_t depth_map;
@@ -136,10 +138,12 @@ static esp_err_t settings_get_handler(httpd_req_t *req)
               cJSON_AddStringToObject(json, "bed_id", settings.bed_id) &&
               cJSON_AddStringToObject(json, "destination_url", settings.destination_url) &&
               cJSON_AddBoolToObject(json, "tft_mirror_x", settings.tft_mirror_x) &&
+              cJSON_AddStringToObject(json, "face_model", monitor_face_model_name(settings.face_model)) &&
               cJSON_AddBoolToObject(json, "key_configured", settings.device_key[0] != 0) &&
               cJSON_AddBoolToObject(json, "restart_required",
                                     strcmp(settings.wifi_ssid, active_ssid) != 0 ||
-                                        strcmp(settings.wifi_password, active_password) != 0);
+                                        strcmp(settings.wifi_password, active_password) != 0 ||
+                                        settings.face_model != active_face_model);
     xSemaphoreGive(state_mutex);
     if (!ok)
     {
@@ -190,10 +194,10 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid settings");
     }
     monitor_settings_t updated;
+    bool restart_after_save;
     xSemaphoreTake(state_mutex, portMAX_DELAY);
-    esp_err_t err = monitor_settings_decode(body, &settings, &updated);
-    if (err == ESP_OK)
-        err = monitor_settings_save(&updated);
+    bool valid = monitor_settings_decode(body, &settings, &updated, &restart_after_save) == ESP_OK;
+    esp_err_t err = valid ? monitor_settings_save(&updated) : ESP_ERR_INVALID_ARG;
     if (err == ESP_OK)
     {
         settings = updated;
@@ -205,12 +209,23 @@ static esp_err_t settings_post_handler(httpd_req_t *req)
     mbedtls_platform_zeroize(&updated, sizeof(updated));
     if (err != ESP_OK)
         return httpd_resp_send_err(req,
-                                   err == ESP_ERR_INVALID_ARG ? HTTPD_400_BAD_REQUEST
-                                                              : HTTPD_500_INTERNAL_SERVER_ERROR,
+                                   valid ? HTTPD_500_INTERNAL_SERVER_ERROR : HTTPD_400_BAD_REQUEST,
                                    "settings save failed");
     esp_err_t cleanup = monitor_settings_cleanup_legacy();
     if (cleanup != ESP_OK)
         ESP_LOGE(TAG, "legacy credential cleanup failed: %s", esp_err_to_name(cleanup));
+    if (restart_after_save)
+    {
+        httpd_resp_set_status(req, "204 No Content");
+        err = httpd_resp_send(req, NULL, 0);
+        if (err == ESP_OK)
+        {
+            // Let the HTTPS response reach the browser before resetting the network.
+            vTaskDelay(pdMS_TO_TICKS(200));
+            esp_restart();
+        }
+        return err;
+    }
     return settings_get_handler(req);
 }
 
@@ -417,7 +432,8 @@ static void sensor_task(void *arg)
             bool detected = false;
             float confidence = 0;
             prone_face_box_t box = {0};
-            esp_err_t err = frame ? prone_inference_init() : ESP_FAIL;
+            esp_err_t err = frame ? prone_inference_init(active_face_model == MONITOR_FACE_ESPDET_PICO_416)
+                                  : ESP_FAIL;
             if (err == ESP_OK)
                 err = prone_inference_run_jpeg(frame->buf, frame->len, &detected, &confidence);
             if (frame)
@@ -457,10 +473,9 @@ static void sensor_task(void *arg)
 
 static void tft_task(void *arg)
 {
-    (void)arg;
+    uint8_t *pixels = arg;
     bool ready = false;
     int64_t next_init = 0;
-    static uint8_t pixels[DEPTH_MAP_STRIP_BYTES];
     TickType_t tick = xTaskGetTickCount();
     while (true)
     {
@@ -590,6 +605,7 @@ void app_main(void)
     }
     strlcpy(active_ssid, settings.wifi_ssid, sizeof(active_ssid));
     strlcpy(active_password, settings.wifi_password, sizeof(active_password));
+    active_face_model = settings.face_model;
     unsigned char random[16];
     esp_fill_random(random, sizeof(random));
     for (size_t i = 0; i < sizeof(random); ++i)
@@ -621,14 +637,23 @@ void app_main(void)
     i2c_master_dev_handle_t depth_device = NULL;
     init_depth_device(&depth_device);
     depth_map.error = !depth_device;
+    // Keep internal RAM available for TLS while the sensor task runs ESPDet.
+    uint32_t sensor_display_stack_memory =
+        active_face_model == MONITOR_FACE_ESPDET_PICO_416 ? MALLOC_CAP_SPIRAM : MALLOC_CAP_INTERNAL;
     ESP_ERROR_CHECK(
-        xTaskCreate(sensor_task, "sensors", 16384, depth_device, tskIDLE_PRIORITY + 1, NULL) == pdPASS
+        xTaskCreateWithCaps(sensor_task, "sensors", 16384, depth_device, tskIDLE_PRIORITY + 1,
+                            NULL, sensor_display_stack_memory | MALLOC_CAP_8BIT) == pdPASS
             ? ESP_OK
             : ESP_ERR_NO_MEM);
     ESP_ERROR_CHECK(
         xTaskCreate(sender_task, "edge_sender", 12288, NULL, tskIDLE_PRIORITY + 1, NULL) == pdPASS
             ? ESP_OK
             : ESP_ERR_NO_MEM);
-    if (xTaskCreate(tft_task, "tft", 4096, NULL, tskIDLE_PRIORITY + 1, NULL) != pdPASS)
+    uint8_t *pixels = heap_caps_malloc(DEPTH_MAP_STRIP_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!pixels || xTaskCreateWithCaps(tft_task, "tft", 4096, pixels, tskIDLE_PRIORITY + 1, NULL,
+                                      sensor_display_stack_memory | MALLOC_CAP_8BIT) != pdPASS)
+    {
+        heap_caps_free(pixels);
         ESP_LOGE(TAG, "TFT task allocation failed");
+    }
 }

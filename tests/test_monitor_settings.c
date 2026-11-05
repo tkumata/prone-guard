@@ -85,9 +85,17 @@ int main(void)
     assert(!memcmp(&loaded, &expected, sizeof(expected)));
     assert(commits == 0 && stored_size == 741);
 
+    expected.tft_mirror_x = 1;
+    stored_size = 742;
+    memcpy(stored, &expected, stored_size);
+    assert(monitor_settings_load(&loaded) == ESP_OK);
+    assert(!memcmp(&loaded, &expected, sizeof(expected)));
+    assert(commits == 0 && stored_size == 742);
+
     for (unsigned mirror = 0; mirror <= 1; ++mirror)
     {
         expected.tft_mirror_x = mirror;
+        expected.face_model = mirror ? MONITOR_FACE_ESPDET_PICO_416 : MONITOR_FACE_MSRMNP;
         assert(monitor_settings_save(&expected) == ESP_OK);
         assert(stored_size == sizeof(expected));
         memset(&loaded, 0xa5, sizeof(loaded));
@@ -95,6 +103,7 @@ int main(void)
         assert(!memcmp(&loaded, &expected, sizeof(expected)));
     }
     expected.tft_mirror_x = 0;
+    expected.face_model = MONITOR_FACE_MSRMNP;
     assert(monitor_settings_save(&expected) == ESP_OK);
     monitor_settings_t before = loaded;
     const size_t bad_sizes[] = {0, 740, sizeof(stored)};
@@ -108,6 +117,9 @@ int main(void)
     stored[741] = 2;
     assert(monitor_settings_load(&loaded) == ESP_ERR_INVALID_STATE);
     stored[741] = 0;
+    stored[742] = 2;
+    assert(monitor_settings_load(&loaded) == ESP_ERR_INVALID_STATE);
+    stored[742] = MONITOR_FACE_MSRMNP;
     stored[0] = 0;
     assert(monitor_settings_load(&loaded) == ESP_ERR_INVALID_STATE);
     stored_size = 741;
@@ -130,6 +142,7 @@ int main(void)
     assert(!memcmp(&loaded, &before, sizeof(loaded)));
 
     expected.tft_mirror_x = 1;
+    expected.face_model = MONITOR_FACE_ESPDET_PICO_416;
     write_error = ESP_FAIL;
     unsigned commits_before = commits;
     assert(monitor_settings_save(&expected) == write_error);
@@ -139,7 +152,7 @@ int main(void)
     assert(monitor_settings_save(&expected) == commit_error);
     commit_error = ESP_OK;
     assert(monitor_settings_load(&loaded) == ESP_OK);
-    assert(loaded.tft_mirror_x == 0);
+    assert(loaded.tft_mirror_x == 0 && loaded.face_model == MONITOR_FACE_MSRMNP);
     expected.tft_mirror_x = 2;
     assert(monitor_settings_save(&expected) == ESP_ERR_INVALID_ARG);
     puts("Settings NVS compatibility, round-trip and failure tests passed");

@@ -7,6 +7,12 @@
 #define MONITOR_URL_MAX 512
 #define MONITOR_TOKEN_LEN 64
 
+enum
+{
+    MONITOR_FACE_MSRMNP = 0,
+    MONITOR_FACE_ESPDET_PICO_416 = 1,
+};
+
 typedef struct
 {
     char wifi_ssid[33];
@@ -15,6 +21,7 @@ typedef struct
     char destination_url[MONITOR_URL_MAX + 1];
     char device_key[MONITOR_TOKEN_LEN + 1];
     uint8_t tft_mirror_x; // Store 0/1 so invalid NVS bytes can be rejected.
+    uint8_t face_model;
 } monitor_settings_t;
 
 typedef struct
@@ -31,6 +38,7 @@ esp_err_t monitor_settings_load(monitor_settings_t *settings);
 esp_err_t monitor_settings_save(const monitor_settings_t *settings);
 esp_err_t monitor_settings_cleanup_legacy(void);
 esp_err_t monitor_settings_decode(const char *json, const monitor_settings_t *current,
-                                  monitor_settings_t *updated);
+                                  monitor_settings_t *updated, bool *restart_after_save);
+const char *monitor_face_model_name(uint8_t model);
 bool monitor_id_valid(const char *value);
 bool monitor_token_valid(const char *value);
