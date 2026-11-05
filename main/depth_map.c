@@ -1,5 +1,6 @@
 #include "depth_map.h"
 #include <assert.h>
+#include <stdio.h>
 #include <string.h>
 
 static bool valid_cell(const depth_map_t *map, int cell)
@@ -7,17 +8,29 @@ static bool valid_cell(const depth_map_t *map, int cell)
     return map->target_status[cell] == 5 && map->distance[cell] >= 0 && map->distance[cell] <= 4000;
 }
 
-static bool text_pixel(const char *text, int x, int y)
+static bool text_pixel(const char *text, int x, int y, int width)
 {
-    static const char letters[] = "-04=ADEHILMNOPRSTVWm";
+    static const char letters[] = "#-/0123456789=ACDEFHILMNOPRSTVWmx";
     static const uint8_t glyphs[][5] = {
+        {0x1c, 0x1c, 0x1c, 0x1c, 0x1c}, // filled square
         {0x08, 0x08, 0x08, 0x08, 0x08}, // -
+        {0x40, 0x20, 0x10, 0x08, 0x04}, // /
         {0x3e, 0x51, 0x49, 0x45, 0x3e}, // 0
+        {0x00, 0x42, 0x7f, 0x40, 0x00}, // 1
+        {0x42, 0x61, 0x51, 0x49, 0x46}, // 2
+        {0x21, 0x41, 0x45, 0x4b, 0x31}, // 3
         {0x18, 0x14, 0x12, 0x7f, 0x10}, // 4
+        {0x27, 0x45, 0x45, 0x45, 0x39}, // 5
+        {0x3c, 0x4a, 0x49, 0x49, 0x30}, // 6
+        {0x01, 0x71, 0x09, 0x05, 0x03}, // 7
+        {0x36, 0x49, 0x49, 0x49, 0x36}, // 8
+        {0x06, 0x49, 0x49, 0x29, 0x1e}, // 9
         {0x14, 0x14, 0x14, 0x14, 0x14}, // =
         {0x7e, 0x11, 0x11, 0x11, 0x7e}, // A
+        {0x3e, 0x41, 0x41, 0x41, 0x22}, // C
         {0x7f, 0x41, 0x41, 0x22, 0x1c}, // D
         {0x7f, 0x49, 0x49, 0x49, 0x41}, // E
+        {0x7f, 0x09, 0x09, 0x09, 0x01}, // F
         {0x7f, 0x08, 0x08, 0x08, 0x7f}, // H
         {0x00, 0x41, 0x7f, 0x41, 0x00}, // I
         {0x7f, 0x40, 0x40, 0x40, 0x40}, // L
@@ -31,19 +44,21 @@ static bool text_pixel(const char *text, int x, int y)
         {0x1f, 0x20, 0x40, 0x20, 0x1f}, // V
         {0x3f, 0x40, 0x38, 0x40, 0x3f}, // W
         {0x7c, 0x04, 0x18, 0x04, 0x78}, // m
+        {0x44, 0x28, 0x10, 0x28, 0x44}, // x
     };
-    int column = x % 8 - 1;
-    if ((size_t)(x / 8) >= strlen(text) || column < 0 || column >= 5 || y < 1 || y > 14)
+    int column = x % width - (width == 8 ? 1 : 0);
+    if ((size_t)(x / width) >= strlen(text) || column < 0 || column >= 5 || y < 1 || y > 14)
         return false;
-    const char *letter = strchr(letters, text[x / 8]);
+    const char *letter = strchr(letters, text[x / width]);
     return letter && ((glyphs[letter - letters][column] >> ((y - 1) / 2)) & 1);
 }
 
-void depth_map_render_strip(const depth_map_t *map, int64_t now_us, bool mirror_x, int first_y,
+void depth_map_render_strip(const depth_map_t *map, int64_t now_us, bool mirror_x,
+                            unsigned face_area_px2, int first_y,
                             uint8_t pixels[DEPTH_MAP_STRIP_BYTES])
 {
     assert(map && pixels && first_y >= 0 && first_y <= DEPTH_MAP_HEIGHT - DEPTH_MAP_STRIP_HEIGHT &&
-           first_y % DEPTH_MAP_STRIP_HEIGHT == 0);
+           first_y % DEPTH_MAP_STRIP_HEIGHT == 0 && face_area_px2 <= 76800);
     const char *state = map->error                            ? "ERROR"
                         : !map->available                     ? "NO DATA"
                         : now_us - map->acquired_us > 5000000 ? "STALE"
@@ -56,6 +71,13 @@ void depth_map_render_strip(const depth_map_t *map, int64_t now_us, bool mirror_
             any_valid |= valid_cell(map, cell);
         state = any_valid ? "DEPTH" : "NO VALID";
     }
+    const char *separator = strlen(state) > 5 ? "/" : " / ";
+    char status[24];
+    if (face_area_px2)
+        snprintf(status, sizeof(status), "%s%sFACE # %u", state, separator, face_area_px2);
+    else
+        snprintf(status, sizeof(status), "%s%sFACE x", state, separator);
+    int indicator_x = (strlen(state) + strlen(separator) + 5) * 6;
     memset(pixels, 0, DEPTH_MAP_STRIP_BYTES);
     for (int y = first_y; y < first_y + DEPTH_MAP_STRIP_HEIGHT; ++y)
         for (int x = 0; x < DEPTH_MAP_WIDTH; ++x)
@@ -63,8 +85,14 @@ void depth_map_render_strip(const depth_map_t *map, int64_t now_us, bool mirror_
             uint8_t *pixel = pixels + ((y - first_y) * DEPTH_MAP_WIDTH + x) * 3;
             if (y >= 128)
             {
-                if (text_pixel(y < 144 ? state : "0-4m NEAR=WHITE", x, y % 16))
-                    pixel[0] = pixel[1] = pixel[2] = 0xfc;
+                if (text_pixel(y < 144 ? status : "0-4m NEAR=WHITE", x, y % 16,
+                               y < 144 ? 6 : 8))
+                {
+                    if (y < 144 && x >= indicator_x && x < indicator_x + 6)
+                        pixel[face_area_px2 ? 1 : 2] = 0xfc; // Face colors follow the panel's BGR order.
+                    else
+                        pixel[0] = pixel[1] = pixel[2] = 0xfc;
+                }
             }
             else if (show_map)
             {

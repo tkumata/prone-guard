@@ -140,7 +140,7 @@ int main(void)
     reset_log();
     assert(tft_display_init() == ESP_OK);
     assert(bus_calls == 2 && device_calls == 2 && reset_calls == 4 && delays == 5);
-    bool rgb666 = false, portrait = false;
+    bool rgb666 = false, portrait_bgr = false;
     for (int i = 0; i < calls; ++i)
         if (writes[i].dc == 0)
         {
@@ -149,9 +149,10 @@ int main(void)
                 rgb666 =
                     writes[i + 1].dc == 1 && writes[i + 1].size == 1 && writes[i + 1].bytes[0] == 6;
             if (writes[i].bytes[0] == 0x36)
-                portrait = writes[i + 1].dc == 1 && !(writes[i + 1].bytes[0] & 0x20);
+                portrait_bgr = writes[i + 1].dc == 1 && writes[i + 1].size == 1 &&
+                               writes[i + 1].bytes[0] == 0xc8;
         }
-    assert(rgb666 && portrait);
+    assert(rgb666 && portrait_bgr);
 
     reset_log();
     for (size_t i = 0; i < sizeof(pixels); ++i)
