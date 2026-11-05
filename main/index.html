@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>prone-guard 設定</title>
-<style>body{font-family:sans-serif;max-width:42rem;margin:2rem auto;padding:0 1rem}label{display:block;margin:1rem 0}input{display:block;font:inherit;width:100%;box-sizing:border-box}input[type=checkbox]{display:inline;width:auto}button{font:inherit;padding:.4rem 1rem}[role=status]{white-space:pre-wrap}</style>
+<style>body{font-family:sans-serif;max-width:42rem;margin:2rem auto;padding:0 1rem}label{display:block;margin:1rem 0}input,select{display:block;font:inherit;width:100%;box-sizing:border-box}input[type=checkbox]{display:inline;width:auto}button{font:inherit;padding:.4rem 1rem}[role=status]{white-space:pre-wrap}</style>
 </head>
 <body>
 <h1>prone-guard 設定</h1>
@@ -16,9 +16,13 @@
 <label for="device-key">デバイスキー<input id="device-key" name="device_key" type="password" pattern="[0-9a-f]{64}" minlength="64" maxlength="64" autocomplete="new-password" placeholder="空欄なら保存済みの値を維持"></label>
 <p id="key-status"></p>
 <label><input id="clear-device-key" type="checkbox">保存済みのデバイスキーを削除し、送信を停止する</label>
+<label for="face-model">顔検知モデル<select id="face-model" name="face_model">
+<option value="msrmnp">MSR + MNP (現行)</option>
+<option value="espdet_pico_416">ESPDet-Pico 416</option>
+</select></label>
 <label><input id="tft-mirror-x" type="checkbox">左右を反転する</label>
-<p>TFT の深度マップだけに適用します。保存後の次回表示更新で反映します。</p>
-<p>ベッド ID または送信先 URL が空欄の場合は送信しません。Wi-Fi の変更は再起動後に反映します。</p>
+<p>左右反転は TFT の深度マップだけに適用します。</p>
+<p>ベッド ID または送信先 URL が空欄の場合は送信しません。保存するとデバイスが自動で再起動します。</p>
 <button id="save" type="submit" disabled>保存</button>
 <p id="settings-status" role="status"></p>
 </form>
@@ -29,6 +33,7 @@ function showSettings(settings){
  element('wifi-ssid').value=settings.wifi_ssid;
  element('bed-id').value=settings.bed_id;
  element('destination-url').value=settings.destination_url;
+ element('face-model').value=settings.face_model;
  element('tft-mirror-x').checked=settings.tft_mirror_x;
  element('key-status').textContent=settings.key_configured?'デバイスキー: 設定済み':'デバイスキー: 未設定';
 }
@@ -39,12 +44,17 @@ async function loadSettings(){
 element('settings').addEventListener('submit',async event=>{
  event.preventDefault();element('save').disabled=true;const message=element('settings-status');message.textContent='保存中…';
  try{
-  const response=await fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({wifi_ssid:element('wifi-ssid').value,wifi_password:element('wifi-password').value,bed_id:element('bed-id').value,destination_url:element('destination-url').value,device_key:element('device-key').value,clear_device_key:element('clear-device-key').checked,tft_mirror_x:element('tft-mirror-x').checked})});
+  const response=await fetch('/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+   wifi_ssid:element('wifi-ssid').value,wifi_password:element('wifi-password').value,
+   bed_id:element('bed-id').value,destination_url:element('destination-url').value,
+   device_key:element('device-key').value,clear_device_key:element('clear-device-key').checked,
+   tft_mirror_x:element('tft-mirror-x').checked,face_model:element('face-model').value,
+   restart_after_save:true
+  })});
   if(!response.ok)throw Error('設定を保存できませんでした ('+response.status+')');
-  const settings=await response.json();showSettings(settings);element('wifi-password').value='';element('device-key').value='';element('clear-device-key').checked=false;
-  message.textContent=settings.restart_required?'保存しました。Wi-Fi の変更を反映するにはデバイスを再起動してください。':'保存しました。';
- }catch(error){message.textContent=error.message;}
- finally{element('save').disabled=false;}
+  element('wifi-password').value='';element('device-key').value='';element('clear-device-key').checked=false;
+  message.textContent='保存しました。デバイスの再起動後にページを開き直してください。';
+ }catch(error){message.textContent=error.message;element('save').disabled=false;}
 });
 async function poll(){
  try{const response=await fetch('/health',{cache:'no-store'});if(!response.ok)throw Error();const health=await response.json();element('health').textContent='Wi-Fi: '+health.wifi+' / 時刻: '+health.clock+' / カメラ: '+health.camera+' / 深度: '+health.depth+' / 送信: '+health.sender;}

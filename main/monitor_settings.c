@@ -5,6 +5,8 @@
 
 _Static_assert(offsetof(monitor_settings_t, tft_mirror_x) == 741,
                "Keep the legacy settings blob layout unchanged");
+_Static_assert(offsetof(monitor_settings_t, face_model) == 742,
+               "Keep the settings blob with TFT mirror compatible");
 
 esp_err_t monitor_settings_load(monitor_settings_t *settings)
 {
@@ -18,7 +20,8 @@ esp_err_t monitor_settings_load(monitor_settings_t *settings)
     nvs_close(handle);
     if (err != ESP_OK)
         return err;
-    if ((size != offsetof(monitor_settings_t, tft_mirror_x) && size != sizeof(loaded)) ||
+    if ((size != offsetof(monitor_settings_t, tft_mirror_x) &&
+         size != offsetof(monitor_settings_t, face_model) && size != sizeof(loaded)) ||
         !monitor_settings_valid(&loaded))
         return ESP_ERR_INVALID_STATE;
     *settings = loaded;

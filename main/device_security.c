@@ -91,7 +91,7 @@ esp_err_t device_provision(const char *json)
         goto done;
     }
     monitor_settings_t empty = {0};
-    if (monitor_settings_decode(settings_json, &empty, &updated) != ESP_OK)
+    if (monitor_settings_decode(settings_json, &empty, &updated, NULL) != ESP_OK)
         goto done;
     mbedtls_x509_crt certificate, ca;
     mbedtls_pk_context key;

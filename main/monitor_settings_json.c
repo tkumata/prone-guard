@@ -3,6 +3,18 @@
 #include "monitor_settings.h"
 #include <string.h>
 
+static const char *const face_model_names[] = {
+    [MONITOR_FACE_MSRMNP] = "msrmnp",
+    [MONITOR_FACE_ESPDET_PICO_416] = "espdet_pico_416",
+};
+
+const char *monitor_face_model_name(uint8_t model)
+{
+    return model < sizeof(face_model_names) / sizeof(face_model_names[0])
+               ? face_model_names[model]
+               : NULL;
+}
+
 bool monitor_id_valid(const char *value)
 {
     size_t len = strlen(value);
@@ -62,7 +74,7 @@ bool monitor_destination_parse(const char *url, monitor_destination_t *destinati
 
 bool monitor_settings_valid(const monitor_settings_t *settings)
 {
-    if (settings->tft_mirror_x > 1 ||
+    if (settings->tft_mirror_x > 1 || !monitor_face_model_name(settings->face_model) ||
         !memchr(settings->wifi_ssid, 0, sizeof(settings->wifi_ssid)) ||
         !memchr(settings->wifi_password, 0, sizeof(settings->wifi_password)) ||
         !memchr(settings->bed_id, 0, sizeof(settings->bed_id)) ||
@@ -102,7 +114,7 @@ static bool field(const cJSON *root, const char *name, char *out, size_t capacit
 }
 
 esp_err_t monitor_settings_decode(const char *json, const monitor_settings_t *current,
-                                  monitor_settings_t *updated)
+                                  monitor_settings_t *updated, bool *restart_after_save)
 {
     cJSON *root = cJSON_ParseWithOpts(json, NULL, true);
     if (!cJSON_IsObject(root))
@@ -116,10 +128,12 @@ esp_err_t monitor_settings_decode(const char *json, const monitor_settings_t *cu
         bool known = false;
         const char *names[] = {"wifi_ssid",       "wifi_password", "bed_id",
                                "destination_url", "device_key",    "clear_device_key",
-                               "tft_mirror_x"};
+                               "tft_mirror_x", "face_model"};
         for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
             if (!strcmp(item->string, names[i]))
                 known = true;
+        if (restart_after_save && !strcmp(item->string, "restart_after_save"))
+            known = true;
         for (const cJSON *other = item->next; other; other = other->next)
             if (!strcmp(item->string, other->string))
                 known = false;
@@ -132,7 +146,10 @@ esp_err_t monitor_settings_decode(const char *json, const monitor_settings_t *cu
     *updated = *current;
     const cJSON *clear = cJSON_GetObjectItemCaseSensitive(root, "clear_device_key");
     const cJSON *mirror = cJSON_GetObjectItemCaseSensitive(root, "tft_mirror_x");
-    bool valid = (!mirror || cJSON_IsBool(mirror)) && (!clear || cJSON_IsBool(clear)) &&
+    const cJSON *model = cJSON_GetObjectItemCaseSensitive(root, "face_model");
+    const cJSON *restart = cJSON_GetObjectItemCaseSensitive(root, "restart_after_save");
+    bool valid = (!restart || cJSON_IsBool(restart)) &&
+                 (!mirror || cJSON_IsBool(mirror)) && (!clear || cJSON_IsBool(clear)) &&
                  field(root, "wifi_ssid", updated->wifi_ssid, sizeof(updated->wifi_ssid), false) &&
                  field(root, "wifi_password", updated->wifi_password,
                        sizeof(updated->wifi_password), true) &&
@@ -144,7 +161,21 @@ esp_err_t monitor_settings_decode(const char *json, const monitor_settings_t *cu
         updated->device_key[0] = 0;
     if (mirror)
         updated->tft_mirror_x = cJSON_IsTrue(mirror);
+    if (model)
+    {
+        valid = valid && cJSON_IsString(model);
+        if (cJSON_IsString(model))
+        {
+            uint8_t id = 0;
+            while (monitor_face_model_name(id) &&
+                   strcmp(model->valuestring, monitor_face_model_name(id)))
+                ++id;
+            updated->face_model = id;
+        }
+    }
     valid = valid && monitor_settings_valid(updated);
+    if (valid && restart_after_save)
+        *restart_after_save = cJSON_IsTrue(restart);
     cJSON_Delete(root);
     return valid ? ESP_OK : ESP_ERR_INVALID_ARG;
 }

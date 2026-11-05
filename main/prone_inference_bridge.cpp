@@ -2,6 +2,7 @@
 #include "face_rotation.h"
 
 #include <stdint.h>
+#include <new>
 
 #include "dl_image_define.hpp"
 #include "dl_image_jpeg.hpp"
@@ -10,6 +11,10 @@
 #include "esp_log.h"
 #include "human_face_detect.hpp"
 
+#if !CONFIG_FLASH_HUMAN_FACE_DETECT_MSRMNP_S8_V1 || !CONFIG_FLASH_ESPDET_PICO_416_416_FACE
+#error "Enable MSR + MNP and ESPDet-Pico 416 in sdkconfig; both models are required."
+#endif
+
 static const char *TAG = "prone_inference";
 static constexpr float DETECTOR_MSR_SCORE_TH = 0.30f;
 static constexpr float DETECTOR_MSR_NMS_TH = 0.45f;
@@ -17,7 +22,8 @@ static constexpr float DETECTOR_MNP_SCORE_TH = 0.35f;
 static constexpr float DETECTOR_MNP_NMS_TH = 0.45f;
 static constexpr float FACE_DETECTED_SCORE_TH = 0.35f;
 
-static human_face_detect::MSRMNP *s_detector;
+static dl::detect::Detect *s_detector;
+static bool s_use_espdet_pico_416;
 static prone_inference_status_t s_status = PRONE_INFERENCE_STATUS_NOT_READY;
 static prone_face_box_t s_last_face_box = {
     .x0 = -1,
@@ -30,39 +36,31 @@ static prone_face_box_t s_last_face_box = {
     .landmarks_valid = false,
 };
 
-esp_err_t prone_inference_init(void)
+esp_err_t prone_inference_init(bool use_espdet_pico_416)
 {
     if (s_detector != nullptr) {
-        s_status = PRONE_INFERENCE_STATUS_OK;
-        return ESP_OK;
+        return use_espdet_pico_416 == s_use_espdet_pico_416 ? ESP_OK : ESP_ERR_INVALID_STATE;
     }
 
-    s_detector = new human_face_detect::MSRMNP("human_face_detect_msr_s8_v1.espdl",
-                                               human_face_detect::MSR::default_score_thr,
-                                               human_face_detect::MSR::default_nms_thr,
-                                               "human_face_detect_mnp_s8_v1.espdl",
-                                               human_face_detect::MNP::default_score_thr,
-                                               human_face_detect::MNP::default_nms_thr);
+    const char *name = use_espdet_pico_416 ? "ESPDet-Pico 416" : "MSRMNP";
+    if (use_espdet_pico_416) {
+        s_detector = new (std::nothrow) human_face_detect::ESPDet(
+            "espdet_pico_416_416_face.espdl",
+            human_face_detect::ESPDet::default_score_thr,
+            human_face_detect::ESPDet::default_nms_thr);
+    } else {
+        s_detector = new (std::nothrow) human_face_detect::MSRMNP(
+            "human_face_detect_msr_s8_v1.espdl", DETECTOR_MSR_SCORE_TH, DETECTOR_MSR_NMS_TH,
+            "human_face_detect_mnp_s8_v1.espdl", DETECTOR_MNP_SCORE_TH, DETECTOR_MNP_NMS_TH);
+    }
     if (s_detector == nullptr) {
         s_status = PRONE_INFERENCE_STATUS_FAULT;
-        ESP_LOGE(TAG, "HumanFaceDetect 初期化失敗");
+        ESP_LOGE(TAG, "推論モデル初期化失敗 detector=%s", name);
         return ESP_ERR_NO_MEM;
     }
-
-    // 内部候補は広めに拾い、最終判定は別閾値で制御する。
-    s_detector->set_score_thr(DETECTOR_MSR_SCORE_TH, 0);
-    s_detector->set_nms_thr(DETECTOR_MSR_NMS_TH, 0);
-    s_detector->set_score_thr(DETECTOR_MNP_SCORE_TH, 1);
-    s_detector->set_nms_thr(DETECTOR_MNP_NMS_TH, 1);
-
+    s_use_espdet_pico_416 = use_espdet_pico_416;
     s_status = PRONE_INFERENCE_STATUS_OK;
-    ESP_LOGI(TAG,
-             "推論モデル読み込み完了 detector=MSRMNP files=[human_face_detect_msr_s8_v1.espdl,human_face_detect_mnp_s8_v1.espdl] th=[msr:%.2f/%.2f,mnp:%.2f/%.2f,final:%.2f] rotation=ccw90",
-             (double)DETECTOR_MSR_SCORE_TH,
-             (double)DETECTOR_MSR_NMS_TH,
-             (double)DETECTOR_MNP_SCORE_TH,
-             (double)DETECTOR_MNP_NMS_TH,
-             (double)FACE_DETECTED_SCORE_TH);
+    ESP_LOGI(TAG, "推論モデル読み込み完了 detector=%s rotation=ccw90", name);
     return ESP_OK;
 }
 
@@ -86,7 +84,7 @@ esp_err_t prone_inference_run_jpeg(const uint8_t *jpeg_data, size_t jpeg_len, bo
         return ESP_FAIL;
     }
 
-    // Keep native VGA detail for MNP; restore public coordinates after inference.
+    // Keep native VGA detail; restore public coordinates after inference.
     if (rgb.width != PRONE_CAMERA_WIDTH || rgb.height != PRONE_CAMERA_HEIGHT) {
         dl::image::img_t vga = {
             .data = heap_caps_malloc(PRONE_CAMERA_WIDTH * PRONE_CAMERA_HEIGHT * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
@@ -110,11 +108,16 @@ esp_err_t prone_inference_run_jpeg(const uint8_t *jpeg_data, size_t jpeg_len, bo
         rgb = vga;
     }
 
+    // ESPDet letterboxes the portrait image internally.
+    const int pad_x = s_use_espdet_pico_416 ? 0 : PRONE_FACE_PAD_X;
+    const int pad_y = s_use_espdet_pico_416 ? 0 : PRONE_FACE_PAD_Y;
+    const uint16_t width = PRONE_CAMERA_HEIGHT + 2 * pad_x;
+    const uint16_t height = PRONE_CAMERA_WIDTH + 2 * pad_y;
     dl::image::img_t upright = {
-        .data = heap_caps_malloc(PRONE_FACE_INPUT_WIDTH * PRONE_FACE_INPUT_HEIGHT * 3,
+        .data = heap_caps_malloc(width * height * 3,
                                  MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
-        .width = PRONE_FACE_INPUT_WIDTH,
-        .height = PRONE_FACE_INPUT_HEIGHT,
+        .width = width,
+        .height = height,
         .pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB888,
     };
     if (upright.data == nullptr) {
@@ -122,15 +125,21 @@ esp_err_t prone_inference_run_jpeg(const uint8_t *jpeg_data, size_t jpeg_len, bo
         s_status = PRONE_INFERENCE_STATUS_FAULT;
         return ESP_ERR_NO_MEM;
     }
-    dl::math::Matrix<float> inverse(2, 3, 0.0f);
-    inverse.array[0][1] = -1;
-    inverse.array[0][2] = PRONE_CAMERA_WIDTH - 1 + PRONE_FACE_PAD_Y;
-    inverse.array[1][0] = 1;
-    inverse.array[1][2] = -PRONE_FACE_PAD_X;
-    dl::image::ImageTransformer transformer;
-    esp_err_t err = transformer.set_src_img(rgb).set_dst_img(upright)
-        .set_warp_affine_matrix(inverse, true)
-        .set_bg_value(std::array<uint8_t, 3>{0, 0, 0}).transform();
+    esp_err_t err = ESP_OK;
+    if (s_use_espdet_pico_416) {
+        prone_face_rotate_rgb888(static_cast<const uint8_t *>(rgb.data),
+                                 static_cast<uint8_t *>(upright.data));
+    } else {
+        dl::math::Matrix<float> inverse(2, 3, 0.0f);
+        inverse.array[0][1] = -1;
+        inverse.array[0][2] = PRONE_CAMERA_WIDTH - 1 + pad_y;
+        inverse.array[1][0] = 1;
+        inverse.array[1][2] = -pad_x;
+        dl::image::ImageTransformer transformer;
+        err = transformer.set_src_img(rgb).set_dst_img(upright)
+            .set_warp_affine_matrix(inverse, true)
+            .set_bg_value(std::array<uint8_t, 3>{0, 0, 0}).transform();
+    }
     heap_caps_free(rgb.data);
     if (err != ESP_OK) {
         heap_caps_free(upright.data);
@@ -161,7 +170,8 @@ esp_err_t prone_inference_run_jpeg(const uint8_t *jpeg_data, size_t jpeg_len, bo
     }
 
     *confidence = best;
-    *is_face_detected = (best >= FACE_DETECTED_SCORE_TH);
+    *is_face_detected = best >= (s_use_espdet_pico_416 ? human_face_detect::ESPDet::default_score_thr
+                                                    : FACE_DETECTED_SCORE_TH);
     s_last_face_box.x0 = best_x0;
     s_last_face_box.y0 = best_y0;
     s_last_face_box.x1 = best_x1;
@@ -181,7 +191,7 @@ esp_err_t prone_inference_run_jpeg(const uint8_t *jpeg_data, size_t jpeg_len, bo
         s_last_face_box.landmarks_valid = false;
     }
 
-    prone_face_box_restore_camera_orientation(&s_last_face_box);
+    prone_face_box_restore_camera_orientation(&s_last_face_box, pad_x, pad_y);
     heap_caps_free(rgb.data);
     s_status = PRONE_INFERENCE_STATUS_OK;
     return ESP_OK;

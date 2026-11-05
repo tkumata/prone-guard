@@ -41,7 +41,7 @@ typedef struct {
     bool landmarks_valid;
 } prone_face_box_t;
 
-esp_err_t prone_inference_init(void);
+esp_err_t prone_inference_init(bool use_espdet_pico_416);
 esp_err_t prone_inference_run_jpeg(const uint8_t *jpeg_data,
                                    size_t jpeg_len,
                                    bool *is_face_detected,
