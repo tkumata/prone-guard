@@ -342,6 +342,8 @@ static esp_err_t init_camera(void)
         .fb_count = 1,
         .fb_location = CAMERA_FB_IN_PSRAM,
         .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
+        // VGA JPEG can exceed the driver's width * height / 5 buffer estimate.
+        .jpeg_buffer_size = 256 * 1024,
     };
     return esp_camera_init(&config);
 }
@@ -397,6 +399,21 @@ static void sensor_task(void *arg)
         if (camera_ready)
         {
             camera_fb_t *frame = esp_camera_fb_get();
+            int64_t frame_age_ms = frame ? (esp_timer_get_time() -
+                                            ((int64_t)frame->timestamp.tv_sec * 1000000 +
+                                             frame->timestamp.tv_usec)) / 1000
+                                        : -1;
+            // A queued frame can predate depth-sensor initialization or recovery.
+            if (frame_age_ms > 1000)
+            {
+                esp_camera_fb_return(frame);
+                frame = esp_camera_fb_get();
+                frame_age_ms = frame ? (esp_timer_get_time() -
+                                         ((int64_t)frame->timestamp.tv_sec * 1000000 +
+                                          frame->timestamp.tv_usec)) / 1000
+                                     : -1;
+            }
+            size_t jpeg_len = frame ? frame->len : 0;
             bool detected = false;
             float confidence = 0;
             prone_face_box_t box = {0};
@@ -407,6 +424,9 @@ static void sensor_task(void *arg)
                 esp_camera_fb_return(frame);
             if (err == ESP_OK)
                 err = prone_inference_get_last_face_box(&box);
+            ESP_LOGI(TAG, "face err=%s jpeg=%u age_ms=%lld detected=%d score=%.3f box=[%d,%d,%d,%d]",
+                     esp_err_to_name(err), (unsigned)jpeg_len, (long long)frame_age_ms,
+                     detected, (double)confidence, box.x0, box.y0, box.x1, box.y1);
             if (err == ESP_OK)
             {
                 observation.camera_ok = true;
@@ -454,11 +474,14 @@ static void tft_task(void *arg)
                 xSemaphoreTake(state_mutex, portMAX_DELAY);
                 map = depth_map;
                 bool mirror_x = settings.tft_mirror_x;
+                unsigned face_area_px2 = latest.camera_ok && latest.face_detected
+                                             ? (unsigned)latest.face_area_px2
+                                             : 0;
                 xSemaphoreGive(state_mutex);
                 int64_t rendered_us = esp_timer_get_time();
                 for (int y = 0; y < DEPTH_MAP_HEIGHT && err == ESP_OK; y += DEPTH_MAP_STRIP_HEIGHT)
                 {
-                    depth_map_render_strip(&map, rendered_us, mirror_x, y, pixels);
+                    depth_map_render_strip(&map, rendered_us, mirror_x, face_area_px2, y, pixels);
                     err = tft_display_write_strip(y, pixels);
                 }
             }

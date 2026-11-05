@@ -29,3 +29,7 @@ cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
   -I"$IDF_PATH/components/esp_common/include" \
   main/tft_display.c tests/test_tft_display.c -o "$test_binary"
 "$test_binary"
+cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+  -I"${IDF_BUILD_DIR:-build}/config" -Imain -I"$IDF_PATH/components/esp_common/include" \
+  tests/test_face_rotation.c -o "$test_binary"
+"$test_binary"

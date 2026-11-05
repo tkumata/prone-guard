@@ -1,4 +1,5 @@
 #include "prone_inference_bridge.h"
+#include "face_rotation.h"
 
 #include <stdint.h>
 
@@ -56,7 +57,7 @@ esp_err_t prone_inference_init(void)
 
     s_status = PRONE_INFERENCE_STATUS_OK;
     ESP_LOGI(TAG,
-             "推論モデル読み込み完了 detector=MSRMNP files=[human_face_detect_msr_s8_v1.espdl,human_face_detect_mnp_s8_v1.espdl] th=[msr:%.2f/%.2f,mnp:%.2f/%.2f,final:%.2f]",
+             "推論モデル読み込み完了 detector=MSRMNP files=[human_face_detect_msr_s8_v1.espdl,human_face_detect_mnp_s8_v1.espdl] th=[msr:%.2f/%.2f,mnp:%.2f/%.2f,final:%.2f] rotation=ccw90",
              (double)DETECTOR_MSR_SCORE_TH,
              (double)DETECTOR_MSR_NMS_TH,
              (double)DETECTOR_MNP_SCORE_TH,
@@ -85,29 +86,58 @@ esp_err_t prone_inference_run_jpeg(const uint8_t *jpeg_data, size_t jpeg_len, bo
         return ESP_FAIL;
     }
 
-    // Keep the existing pixel thresholds and face-box coordinates at QVGA.
-    if (rgb.width != 320 || rgb.height != 240) {
-        dl::image::img_t small = {
-            .data = heap_caps_malloc(320 * 240 * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
-            .width = 320,
-            .height = 240,
+    // Keep native VGA detail for MNP; restore public coordinates after inference.
+    if (rgb.width != PRONE_CAMERA_WIDTH || rgb.height != PRONE_CAMERA_HEIGHT) {
+        dl::image::img_t vga = {
+            .data = heap_caps_malloc(PRONE_CAMERA_WIDTH * PRONE_CAMERA_HEIGHT * 3, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+            .width = PRONE_CAMERA_WIDTH,
+            .height = PRONE_CAMERA_HEIGHT,
             .pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB888,
         };
-        if (small.data == nullptr) {
+        if (vga.data == nullptr) {
             heap_caps_free(rgb.data);
             s_status = PRONE_INFERENCE_STATUS_FAULT;
             return ESP_ERR_NO_MEM;
         }
         dl::image::ImageTransformer transformer;
-        esp_err_t err = transformer.set_src_img(rgb).set_dst_img(small).transform();
+        esp_err_t err = transformer.set_src_img(rgb).set_dst_img(vga).transform();
         heap_caps_free(rgb.data);
         if (err != ESP_OK) {
-            heap_caps_free(small.data);
+            heap_caps_free(vga.data);
             s_status = PRONE_INFERENCE_STATUS_FAULT;
             return err;
         }
-        rgb = small;
+        rgb = vga;
     }
+
+    dl::image::img_t upright = {
+        .data = heap_caps_malloc(PRONE_FACE_INPUT_WIDTH * PRONE_FACE_INPUT_HEIGHT * 3,
+                                 MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT),
+        .width = PRONE_FACE_INPUT_WIDTH,
+        .height = PRONE_FACE_INPUT_HEIGHT,
+        .pix_type = dl::image::DL_IMAGE_PIX_TYPE_RGB888,
+    };
+    if (upright.data == nullptr) {
+        heap_caps_free(rgb.data);
+        s_status = PRONE_INFERENCE_STATUS_FAULT;
+        return ESP_ERR_NO_MEM;
+    }
+    dl::math::Matrix<float> inverse(2, 3, 0.0f);
+    inverse.array[0][1] = -1;
+    inverse.array[0][2] = PRONE_CAMERA_WIDTH - 1 + PRONE_FACE_PAD_Y;
+    inverse.array[1][0] = 1;
+    inverse.array[1][2] = -PRONE_FACE_PAD_X;
+    dl::image::ImageTransformer transformer;
+    esp_err_t err = transformer.set_src_img(rgb).set_dst_img(upright)
+        .set_warp_affine_matrix(inverse, true)
+        .set_bg_value(std::array<uint8_t, 3>{0, 0, 0}).transform();
+    heap_caps_free(rgb.data);
+    if (err != ESP_OK) {
+        heap_caps_free(upright.data);
+        s_status = PRONE_INFERENCE_STATUS_FAULT;
+        return err;
+    }
+    rgb = upright;
 
     std::list<dl::detect::result_t> &result = s_detector->run(rgb);
 
@@ -151,6 +181,7 @@ esp_err_t prone_inference_run_jpeg(const uint8_t *jpeg_data, size_t jpeg_len, bo
         s_last_face_box.landmarks_valid = false;
     }
 
+    prone_face_box_restore_camera_orientation(&s_last_face_box);
     heap_caps_free(rgb.data);
     s_status = PRONE_INFERENCE_STATUS_OK;
     return ESP_OK;
