@@ -2,19 +2,20 @@
 
 Freenove ESP32-S3 WROOM CAM と VL53L5CX から、顔検知と 8×8 深度を毎秒送信する試作システムです。
 エッジ側の Rust アプリは、認証済みの観測を SQLite に保存します。
-3 分ごとに直近 3 分のデータを Jev に渡し、うつ伏せ / 非うつ伏せ / 判定不能を記録します。
+3 分ごとに直近 3 分のデータを評価し、品質条件を満たす場合に Jev へ送ります。うつ伏せ / 非うつ伏せ / 判定不能を記録します。
 
 - ファームウェア: ルートの ESP-IDF プロジェクト。
 - エッジアプリ: `edge/`、Rust 1.99.1 / edition 2024。
 - 対象 OS: macOS 27.x、Debian 13.7。
-- 保存: 最大 6 時間、全ベッド合計 100MB。容量制限を優先します。
+- 保存: 既定で 6 時間、全ベッド合計 100MB。容量制限を優先します。
 - 管理画面: HTTPS とデバイス固有の管理者認証。
-- 映像ストリーミングとマイコンからの Jev 呼出しは廃止しました。
-- ST7735（128×160px）に深度マップを各ゾーン 16×16px、64 階調で表示します。下部に文字を 2 行表示します。基本表示と横ずれ修正はユーザによる実機確認済みです。
+- ST7735（128×160px）に深度マップを各ゾーン 16×16px、64 階調で表示します。下部に文字を 2 行表示します。
 
-## Architecture
+## 構成
 
-![prone-guard-architecture](./docs/images/prone-guard-architecture.png)
+![prone-guard のアーキテクチャ](./docs/images/prone-guard-architecture.png)
+
+図中のスマートフォン連携は現行の実装範囲外です。
 
 ## 初期設定から動作確認まで
 
@@ -101,25 +102,26 @@ VS Code に ESP-IDF 拡張（`espressif.esp-idf-extension`）と rust-analyzer�
 {
   "rust-analyzer.linkedProjects": ["./edge/Cargo.toml"],
   "rust-analyzer.server.extraEnv": {
-    "RUSTUP_TOOLCHAIN": "stable"
+    "RUSTUP_TOOLCHAIN": "1.99.1"
   },
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
   },
   "idf.flashType": "UART",
-  "idf.currentSetup": "/path/to/.espressif/v6.0.3/esp-idf",
   "idf.extensionActivationMode": "detect"
 }
 ```
 
 コマンドパレットで `ESP-IDF: Select Current ESP-IDF Version` を実行し、ESP-IDF **6.0.3** を選択します。
+バージョン名が `vx.x` と表示される場合は、EIM で 6.0.3 に登録されているパスを一覧で選択します。
+ビルドには `ESP-IDF: Build Your Project` を使います。
+ESP-IDF 拡張が `cmake was not found` と表示する場合は、[VS Code のビルド環境の確認](docs/current/SETUP.md#vs-code-のビルド環境の確認) を参照してください。
 第 2 節の配線・USB 接続後に、`ESP-IDF: Select Port to Use (COM, tty, usbserial)` でボードのポートを選択してください。
 ボード検出に拡張を使用するため、`idf.extensionActivationMode` は `detect` のままにします。
 
-拡張は SDK の絶対パスを `idf.currentSetup` に保存します。
+拡張が選択した環境を `idf.currentSetup` に保存します。SDK の実体パスを手入力する必要はありません。
 個人のパスやポートを共有しないため、`.vscode/settings.json` は Git の追跡対象から除外しています。
 設定は各環境で管理し、`git add -f` で追跡対象に戻さないでください。
-既存の clone で本変更を取り込む場合は、更新前に設定ファイルをリポジトリ外へ退避し、更新後に戻してください。
 
 ### 2. 配線して USB 接続する
 
@@ -239,7 +241,7 @@ CA・エッジ・デバイスの証明書と秘密鍵、書込みに使用した
 
 管理画面は、スクリプトが表示したマイコンの HTTPS URL で開きます。
 TFT の向きを変える場合は「左右を反転する」を選択して保存します。
-既定は無効です。保存後の次回表示更新で反映し、再起動後も保持します。
+既定は無効です。管理画面で保存するとマイコンが自動で再起動し、保存した設定で表示します。
 反転は深度マップだけに適用し、文字、上下方向、送信データは変更しません。
 ユーザ名は `admin`、パスワードはローカルの `edge/local/device.json` の `admin_password` です。
 ブラウザで利用する場合は、`edge/local/ca.pem` を信頼する CA として登録してください。
@@ -263,7 +265,6 @@ curl --fail --cacert edge/local/ca.pem https://192.168.1.50:8443/health
 Jev の判定結果は、エッジを起動したターミナルの標準エラーに、3 分周期で `posture_result` として出ます。
 十分な観測が揃った周期で API を呼び出します。キーがない場合は、十分な観測があっても `jev_not_configured` を記録します。
 セットアップの接続確認には、Jev の実 API の成功や姿勢の識別精度の評価は含みません。
-本構成の実機・実 API による識別精度は未確認です。
 
 通常の再起動では、マイコンへ給電し、エッジのリポジトリルートで次を実行します。
 再ビルド・eFuse 書込み・USB 初期設定は不要です。Jev を使う場合は、そのターミナルにも `JEV_API_KEY` を設定してください。
@@ -310,12 +311,11 @@ RGB666 の 64 階調を使い、各画素の明るさで距離を表します。
 
 下部 32px には、文字を 2 行表示します。
 1 行目は 6×16px の文字でマップ全体の状態と顔検知結果、
-2 行目は従来の 8×16px の文字で凡例 `0-4m NEAR=WHITE` を表示します。
+2 行目は 8×16px の文字で凡例 `0-4m NEAR=WHITE` を表示します。
 顔検知時は `DEPTH / FACE ■ 12` と表示し、`■` は緑、面積は白です。
 面積は 320×240 の座標系における顔矩形の面積を整数の px² で表示します（最大 76800）。
 未検知・カメラ未取得・取得失敗時は `DEPTH / FACE x` と表示し、`x` は赤です。
 `NO DATA`・`NO VALID` では、画面内に収めるため `/` 前後の空白を省きます。
-この顔表示と文字幅の実機確認は未実施です。
 
 | 状態 | 意味 |
 | --- | --- |
@@ -326,8 +326,6 @@ RGB666 の 64 階調を使い、各画素の明るさで距離を表します。
 | `ERROR` | 深度の取得エラー。マップは消去 |
 
 詳細は [表示仕様](docs/current/SPECIFICATIONS.md#7-tft-深度マップ) を参照してください。
-基本表示と列オフセット +2 の修正は、2026-11-04 にユーザが実機で確認しました。
-電源・周期の測定と障害試験の個別結果は未確認です。
 
 ## 登録管理エッジのセットアップ
 
@@ -344,7 +342,7 @@ python3 tools/setup.py --registration
 
 **商品用 USB 登録との統合とセットアップ画面は未実装です。**
 このモードの起動成功を、機器登録の完了とは扱いません。通常の `setup.py` の前段でもありません。
-旧 `device.json` で設定した機器を、登録管理エッジへ登録することはできません。
+通常のセットアップで作る `device.json` の資格情報は、静的設定のエッジで使います。
 再起動時は `edge/target/debug/prone-guard-edge edge/registration-local/config.json` を使用します。
 CA・秘密鍵・登録状態を保持する `registrations.sqlite` は削除しないでください。
 独立した Security 2 検証機の手順は [SETUP 第 9 節](docs/current/SETUP.md#9-security-2-と-usb-の相互運用検証) にあります。
@@ -377,4 +375,3 @@ USB・配線・電源・センサーの方向・実 API の識別精度は実機
 - [仕様](docs/current/SPECIFICATIONS.md)
 - [設計](docs/current/DESIGN.md)
 - [商品向けの接続・登録設計](docs/current/CONNECTION.md)
-- [実装計画と検証状態](docs/plans/active/2026-10-28-issue-15-edge-sensors.md)

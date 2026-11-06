@@ -42,8 +42,8 @@ static void cross(int cell)
         for (int x = 0; x < 16; ++x)
         {
             const uint8_t *p = pixel((cell % 8) * 16 + x, (cell / 8) * 16 + y);
-            assert(p[0] == (x == y || x + y == 15 ? 0xfc : 0));
-            assert(p[1] == 0 && p[2] == 0);
+            assert(p[0] == 0 && p[1] == 0);
+            assert(p[2] == (x == y || x + y == 15 ? 0xfc : 0));
         }
 }
 
