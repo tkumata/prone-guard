@@ -104,7 +104,7 @@ void depth_map_render_strip(const depth_map_t *map, int64_t now_us, bool mirror_
                     pixel[0] = pixel[1] = pixel[2] = level << 2;
                 }
                 else if (x % 16 == y % 16 || x % 16 + y % 16 == 15)
-                    pixel[0] = 0xfc;
+                    pixel[2] = 0xfc; // Red follows the panel's BGR order.
             }
         }
 }

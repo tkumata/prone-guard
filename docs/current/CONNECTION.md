@@ -2,7 +2,19 @@
 
 お客様だけで安全に接続を完結できることを必須要件とする。
 本書は商品向けの接続仕様を定義する。
-実装・検証状態は [実装計画](../plans/active/2026-10-28-issue-15-edge-sensors.md)、判断理由は [ADR-0002](../adr/0002-customer-device-pairing.md) で管理する。
+判断理由は [ADR-0002](../adr/0002-customer-device-pairing.md) に記載する。
+
+## 現在の実装範囲
+
+| 構成 | コードベースが提供する動作 |
+| --- | --- |
+| 通常のファームウェアと `tools/setup.py` | USB の平文 JSON で開発用の初期設定を行い、静的設定のエッジに HTTPS で観測を送る |
+| `tools/setup.py --registration` | エッジで登録 DB、CA、サーバ証明書、mDNS 広告を使用する。エッジは準備中のキーによる接続確認と、有効なキーによる観測受付を提供する |
+| `tests/pairing_device/` と `pairing_probe` | USB で Security 2 の相互認証、機器 ID の照合、初期時刻の設定を検証する |
+
+商品向けのセットアップ画面、通常のファームウェアへの認証付き USB 登録の統合、機器の管理証明書更新 API は未実装である。
+実行手順は [環境構築と運用](SETUP.md)、実装済みの HTTP API は [仕様](SPECIFICATIONS.md) に記載する。
+以下の各節は商品向けの設計と受入条件を定義する。
 
 ## 1. 採用する接続方式
 
@@ -13,7 +25,7 @@ USB も信頼済みとは扱わず、機器固有の登録コードで認証し�
 初回だけでなく再実行と途中失敗からの再開に対応し、使用中の鍵や無関係な機器設定を上書きしない。
 お客様にターミナル、SDK、証明書生成、CA 登録、固定 IP、秘密ファイル編集を要求しない。
 登録専用クラウド、スマートフォン、Bluetooth アダプタを必須にしない。
-Jev のインターネット接続は従来どおり必要だが、機器登録の認証基盤には使わない。
+Jev で判定するにはインターネット接続が必要である。機器登録の認証はローカルで行う。
 
 ```mermaid
 flowchart LR
@@ -89,8 +101,6 @@ ESP-IDF 6.0.3 の標準 `protocomm_console` は UART 用で、行バッファが
 現在の USB Serial/JTAG にそのまま接続できるとは扱わない。
 既存 USB I/O と公開 `protocomm` API を接続する、長さ上限付きの transport を実装する。
 Security 2 のハンドシェイクと AES-GCM の nonce 管理は公式実装に任せる。
-エッジ側の SRP・暗号処理、シリアル I/O、証明書生成、mDNS に必要な依存は実装前に版・保守状況を確認する。
-今回の文書修正で、未選定の依存の導入まで承認済みとは扱わない。
 
 ### 登録状態
 
@@ -178,7 +188,12 @@ LAN からローカル管理画面を操作できる設定は初期版に追加�
 旧エッジの記録を遠隔削除できたとは表示しない。旧エッジの保存データは別途消去が必要である。
 自動更新前に既に期限切れとなった場合も、検証を省略せず USB で復旧する。
 機器の管理証明書の更新は、現証明書を検証した所有者認証付き HTTPS で公開証明書だけを渡す。
-更新 API は同じ機器内の公開鍵・CA・SAN と一致する更新証明書だけを受け付け、秘密鍵・信頼根・所有者の変更には使わない。
+商品向けの更新 API は `POST /security/certificate` とし、管理者認証と Origin 検証を要求する。
+本文は `certificate` 文字列だけを持つ JSON とし、上限を 16KiB とする。
+更新 API は同じ機器内の公開鍵・CA・SAN と一致する証明書だけを受け付ける。
+証明書の serverAuth 用途、有効期間と現在時刻を検証する。有効期限が延びる場合だけ原子的に保存する。
+保存成功時に `204` を返し、アプリが更新後の証明書で TLS 接続を確認する。保存や読出しに失敗した場合は直前の証明書を維持する。
+不正な本文・証明書は `400`、過大な本文は `413`、認証不正は `401`、Origin 不正は `403`、保存失敗は `500` とする。
 機器の秘密鍵や信頼根の交換は、所有者認証付き USB の登録世代切替で行う。
 完全な登録解除後も、機器 ID、製造時の認証情報、eFuse の保護は維持する。
 カードと所有者用の管理認証情報を両方失った場合の、認証を迂回する解除機能は設けない。
@@ -204,12 +219,10 @@ LAN 上の第三者、偽のエッジ、偽の USB 機器、盗聴、改ざん�
 - 登録情報を観測の保持期限処理で消去せず、失効を再起動後も維持する。
 
 既存の試作テストは、これらの商品向け受入条件の合格証拠には流用しない。
-実装タスクと未検証項目は [実装計画](../plans/active/2026-10-28-issue-15-edge-sensors.md) で管理する。
 
 ## 8. 根拠
 
 - [ESP-IDF Protocol Communication](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-reference/provisioning/protocomm.html): Security 2 と transport の分離。
 - [ESP-IDF Security Overview](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/security/security.html): 製造時の保護、通信・更新の保護。
 - [ESP-IDF 6.0.3 ESP-TLS](https://docs.espressif.com/projects/esp-idf/en/v6.0.3/esp32s3/api-reference/protocols/esp_tls.html): CA と接続先名の検証。
-- ローカルの ESP-IDF 6.0.3 の `components/protocomm/` の公開 API と console 実装を照合した。
-  上記 stable 文書は調査時に v6.1 を指すため、6.0.3 に存在する機能と区別して参照した。
+- ESP-IDF 6.0.3 の API と console の動作は、SDK 内の `components/protocomm/` を参照する。
