@@ -11,6 +11,7 @@ import signal
 import socket
 import sqlite3
 import ssl
+import struct
 import subprocess
 import tempfile
 import time
@@ -140,6 +141,102 @@ class EdgeHTTPS(unittest.TestCase):
                         process.send_signal(signal.SIGINT)
                     process.wait(timeout=10)
                 self.assertEqual(process.returncode, 0)
+            self.assert_mdns_conflict_isolated(root, config_path, port, hostname, context, environment)
+
+    def assert_mdns_conflict_isolated(self, root, config_path, port, hostname, context, environment):
+        def dns_name(name):
+            return b"".join(bytes([len(label)]) + label.encode("ascii")
+                            for label in name.split(".")) + b"\0"
+
+        # A same-name SRV response with a different port conflicts during probing.
+        other_port = port - 1 if port == 65535 else port + 1
+        instance = hostname.removesuffix(".local")
+        srv = struct.pack("!HHH", 0, 0, other_port) + dns_name(hostname)
+        packet = (struct.pack("!HHHHHH", 0, 0x8400, 0, 1, 0, 0)
+                  + dns_name(f"{instance}._prone-guard._tcp.local")
+                  + struct.pack("!HHIH", 33, 0x8001, 120, len(srv)) + srv)
+        log_path = root / "conflict.log"
+        with log_path.open("wb") as log, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+            sender.bind(("127.0.0.1", 0))
+            sender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton("127.0.0.1"))
+            sender.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 1)
+            process = subprocess.Popen([str(ROOT / "edge/target/debug/prone-guard-edge"), str(config_path)],
+                                       cwd=root, stdout=log, stderr=log, env=environment)
+            try:
+                deadline = time.monotonic() + 5
+                while (time.monotonic() < deadline and process.poll() is None
+                       and "mDNS name conflict" not in log_path.read_text()):
+                    sender.sendto(packet, ("224.0.0.251", 5353))
+                    time.sleep(0.02)
+                self.assertIn('"event":"mdns_advertisement_failed"', log_path.read_text())
+                self.assertIn("mDNS name conflict", log_path.read_text())
+                self.assertIsNone(process.poll())
+
+                connection = http.client.HTTPSConnection(hostname, port, context=context, timeout=3)
+                try:
+                    connection.sock = context.wrap_socket(
+                        socket.create_connection(("127.0.0.1", port), timeout=3), server_hostname=hostname)
+                    connection.request("GET", "/health")
+                    with connection.getresponse() as response:
+                        self.assertEqual(response.status, 200)
+                        response.read()
+                finally:
+                    connection.close()
+
+                with contextlib.closing(sqlite3.connect(root / "edge/registration-local/sensors.sqlite")) as db:
+                    db.execute("INSERT INTO results VALUES ('test', 0, 0, '{}')")
+                    db.commit()
+                    deadline = time.monotonic() + 4
+                    while db.execute("SELECT COUNT(*) FROM results").fetchone()[0]:
+                        self.assertLess(time.monotonic(), deadline, "periodic expiry stopped")
+                        time.sleep(0.05)
+            finally:
+                if process.poll() is None:
+                    process.send_signal(signal.SIGINT)
+                process.wait(timeout=10)
+            self.assertEqual(process.returncode, 0)
+
+    def assert_request_deadlines(self, port, context, token, body):
+        with contextlib.ExitStack() as stack:
+            def connect():
+                tcp = stack.enter_context(socket.create_connection(("127.0.0.1", port), timeout=8))
+                return stack.enter_context(context.wrap_socket(tcp, server_hostname="127.0.0.1"))
+
+            idle = connect()
+            preface = connect()
+            preface.sendall(b"PRI ")
+            incomplete = connect()
+            incomplete.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\n")
+            reused = connect()
+            reused.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            with http.client.HTTPResponse(reused) as response:
+                response.begin()
+                self.assertEqual(response.status, 200)
+                response.read()
+            reused.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\n")
+
+            stalled_body = connect()
+            stalled_body.sendall(
+                b"POST /v1/measurements HTTP/1.1\r\nHost: localhost\r\n"
+                b"Content-Type: application/x-ndjson\r\nContent-Length: 32\r\n\r\n{"
+            )
+            connection = http.client.HTTPSConnection("127.0.0.1", port, context=context, timeout=3)
+            stack.callback(connection.close)
+            connection.request("POST", "/v1/measurements", body, {
+                "Content-Type": "application/x-ndjson", "Authorization": f"Bearer {token}",
+            })
+            with connection.getresponse() as response:
+                self.assertEqual(response.status, 204)
+                response.read()
+
+            for stream in (incomplete, idle, preface, reused):
+                while stream.recv(4096):
+                    pass
+            with http.client.HTTPResponse(stalled_body) as response:
+                response.begin()
+                self.assertEqual(response.status, 408)
+                response.read()
+            self.assertEqual(stalled_body.recv(1), b"")
 
     def test_tls_authentication_ingest_and_body_limit(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -203,6 +300,7 @@ class EdgeHTTPS(unittest.TestCase):
                         self.assertEqual(response.status, expected)
                         response.read()
                         connection.close()
+                    self.assert_request_deadlines(port, context, token, body)
                     with contextlib.closing(sqlite3.connect(root / "data.sqlite")) as database:
                         self.assertEqual(database.execute("SELECT count(*) FROM observations").fetchone()[0], 1)
                     if os.geteuid() != 0:

@@ -4,7 +4,10 @@ use std::{
     env,
     path::Path,
     sync::{Arc, Mutex, atomic::AtomicBool},
+    time::Duration,
 };
+
+const REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -51,18 +54,20 @@ async fn main() -> Result<()> {
     let scheduler = tokio::spawn(scheduler(app.clone(), key));
     let maintenance = tokio::spawn(maintenance(app.clone()));
     let certificate_maintenance = tokio::spawn(renew_certificates(app.clone(), tls.clone()));
-    let discovery_monitor = async {
-        match &discovery {
-            Some(discovery) => discovery.monitor().await,
-            None => std::future::pending::<Result<()>>().await,
-        }
-    };
+    if let Some(discovery) = discovery {
+        tokio::spawn(discovery.monitor());
+    }
+    let mut server =
+        axum_server::bind_rustls(address, tls).first_request_timeout(REQUEST_HEADER_TIMEOUT);
+    server
+        .http_builder()
+        .http1()
+        .header_read_timeout(REQUEST_HEADER_TIMEOUT);
     tokio::select! {
-        result=axum_server::bind_rustls(address,tls).serve(router(app).into_make_service()) => {result?;}
+        result=server.serve(router(app).into_make_service()) => {result?;}
         result=scheduler => {result??; anyhow::bail!("scheduler stopped");}
         result=maintenance => {result??; anyhow::bail!("maintenance stopped");}
         result=certificate_maintenance => {result??; anyhow::bail!("certificate maintenance stopped");}
-        result=discovery_monitor => {result?; anyhow::bail!("discovery stopped");}
         result=tokio::signal::ctrl_c() => {result?;}
     }
     Ok(())

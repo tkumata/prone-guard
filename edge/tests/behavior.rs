@@ -126,41 +126,78 @@ fn missing_data_duplicates_and_staleness_do_not_pass_quality_gate() {
 }
 
 #[test]
-fn jev_request_contains_full_window_and_excludes_device_identity() {
+fn jev_rollover_request_contains_the_ordered_window_and_excludes_device_identity() {
     let window = measurement::prepare_window(rows(START + 180), START + 180).unwrap();
     let request = jev::request(&window, START + 180, &json!({"mount":"overhead"})).unwrap();
     let jsonl = request["state"]["observations_jsonl"].as_str().unwrap();
     assert_eq!(jsonl.lines().count(), 180);
-    let first: Value = serde_json::from_str(jsonl.lines().next().unwrap()).unwrap();
-    assert!(first.get("bed_id").is_none() && first.get("boot_id").is_none());
-    assert_eq!(first["depth"]["distance"].as_array().unwrap().len(), 8);
+    let expected = sample(START);
+    for (second, line) in (START..START + 180).zip(jsonl.lines()) {
+        let observation: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(observation["timestamp"], second);
+        assert!(observation.get("bed_id").is_none() && observation.get("boot_id").is_none());
+        assert_eq!(
+            observation["camera"]["face_detected"],
+            json!(expected.camera.face_detected)
+        );
+        assert_eq!(
+            observation["camera"]["face_area_px2"],
+            json!(expected.camera.face_area_px2)
+        );
+        assert_eq!(
+            observation["depth"]["distance"],
+            json!(expected.depth.distance)
+        );
+        assert_eq!(
+            observation["depth"]["target_status"],
+            json!(expected.depth.target_status)
+        );
+    }
+    assert_eq!(request["state"]["window"]["start"], START);
     assert_eq!(request["state"]["window"]["end_exclusive"], START + 180);
+    let questions = request["questions"].as_object().unwrap();
+    assert_eq!(questions.len(), 1);
+    let question = &questions["rollover"];
+    assert_eq!(question["type"], "choice");
+    let criteria = question["criteria"].as_object().unwrap();
+    assert_eq!(criteria.len(), 3);
+    for label in ["rollover_detected", "no_rollover", "unjudgeable"] {
+        assert!(criteria[label].is_string());
+    }
 }
 
 fn answer() -> Value {
-    json!({"model":jev::MODEL,"answers":{"posture":{"type":"choice","choice":"prone","confidence":0.95,"probabilities":{"prone":0.96,"not_prone":0.02,"unjudgeable":0.02}}}})
+    json!({"model":jev::MODEL,"answers":{"rollover":{"type":"choice","choice":"rollover_detected","confidence":0.95,"probabilities":{"rollover_detected":0.96,"no_rollover":0.02,"unjudgeable":0.02}}}})
 }
 #[test]
-fn jev_uncertainty_and_malformed_answers_never_become_not_prone() {
-    assert_eq!(jev::parse(&answer()).unwrap()["status"], "prone");
+fn jev_validates_rollover_results_and_preserves_uncertainty() {
+    let detected = jev::parse(&answer()).unwrap();
+    assert_eq!(detected["status"], "rollover_detected");
+    assert_eq!(detected["question_version"], "sensor-rollover-v1");
+    let mut response = answer();
+    response["answers"]["rollover"]["choice"] = json!("no_rollover");
+    response["answers"]["rollover"]["probabilities"] =
+        json!({"rollover_detected":0.02,"no_rollover":0.96,"unjudgeable":0.02});
+    assert_eq!(jev::parse(&response).unwrap()["status"], "no_rollover");
+    response["answers"]["rollover"]["confidence"] = json!(0.899);
+    assert_eq!(jev::parse(&response).unwrap()["status"], "unjudgeable");
     let mut unexpected = answer();
-    unexpected["answers"]["posture"]["echoed_input"] = json!("private sensor information");
+    unexpected["answers"]["rollover"]["echoed_input"] = json!("private sensor information");
     assert!(
         jev::parse(&unexpected).unwrap()["answer"]
             .get("echoed_input")
             .is_none()
     );
     let mut response = answer();
-    response["answers"]["posture"]["confidence"] = json!(0.899);
-    assert_eq!(jev::parse(&response).unwrap()["status"], "unjudgeable");
-    let mut response = answer();
     response["model"] = json!("other");
     assert!(jev::parse(&response).is_err());
     let mut response = answer();
-    response["answers"]["posture"]["probabilities"]["prone"] = json!(0.1);
+    response["answers"]["rollover"]["probabilities"]["rollover_detected"] = json!(0.1);
     assert!(jev::parse(&response).is_err());
     let mut response = answer();
-    response["answers"]["posture"]["choice"] = json!("not_prone");
+    response["answers"]["rollover"]["choice"] = json!("no_rollover");
+    assert!(jev::parse(&response).is_err());
+    response["answers"]["rollover"]["choice"] = json!("prone");
     assert!(jev::parse(&response).is_err());
 }
 
@@ -344,6 +381,7 @@ async fn insufficient_data_skips_the_external_api_and_records_unjudgeable() {
         .unwrap();
     let value: Value = serde_json::from_str(&result).unwrap();
     assert_eq!(value["status"], "unjudgeable");
+    assert_eq!(value["question_version"], "sensor-rollover-v1");
     assert!(
         value["reason"]
             .as_str()
