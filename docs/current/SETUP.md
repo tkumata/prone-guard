@@ -412,6 +412,10 @@ JEV_API_KEY が未設定でも、観測の受付と保存は行う。
 品質条件を満たす判定周期では `jev_not_configured` を記録する。
 API key が設定されている場合は、3 分分の観測が揃ってから送信する。
 結果とデータ不足の理由は標準エラーへ JSON で記録する。
+`posture_result.result.quality` に有効観測秒数、欠測、センサ別エラーと時刻差の集計を出力する。
+品質条件を満たして候補抽出へ到達した場合は、`posture_result.result.depth_motion_candidates` に深度変化の候補と前後の比較値を出力する。
+候補は寝返りを確定するものではなく、Jevの回答とも区別する。
+Jev通信の失敗は `jev_error` として記録し、認証情報と観測原文をログへ含めない。
 システムサービスで運用する場合は、ログの保存先とローテーションを設定する。
 ログに生のセンサーデータや秘密を保存しない。
 
@@ -437,6 +441,7 @@ python3 -m unittest discover -s tests -p 'test_setup.py'
 cargo test --manifest-path edge/Cargo.toml --locked
 cargo clippy --manifest-path edge/Cargo.toml --locked --all-targets -- -D warnings
 python3 -m unittest discover -s tests -p 'test_edge_https.py'
+python3 -m unittest discover -s tests -p 'test_evaluate_rollover.py'
 ```
 
 別の ESP-IDF ビルド先を使う場合は、IDF_BUILD_DIR を指定する。
@@ -447,6 +452,19 @@ TFT では、各セルの 16×16px 対応、64 階調、文字 2 行、無効セ
 同時接続で測距・送信周期を保てること、転送失敗の記録と取得・送信の継続を確認する。
 TFT 未接続時の取得・送信継続、バックライト点灯時の電源も実機で確認する。
 Jev の 180 秒入力、30 秒期限、姿勢ごとの識別能力は別に検証する。
+正解ラベル付きの評価では、`bed_id,window_start,window_end_exclusive,label,event_at` のCSVを用意する。
+`label` は `rollover` または `no_rollover` とし、寝返りがあった窓では `event_at` に発生時刻（Unix秒）を指定する。
+エッジの標準エラーに出力された `posture_result` 行を `edge.log.jsonl` に保存した後、リポジトリルートで以下を実行する。
+
+```sh
+python3 tools/evaluate_rollover.py labels.csv edge.log.jsonl
+```
+
+このコマンドは検知率、誤検知率、判定不能率、検知遅延を出力する。
+判定ログが存在しない窓は判定不能として数える。
+`recall_conservative` では判定不能を未検知として数える。
+検知遅延は `evaluated_at - event_at` を使用し、3分周期の待ち時間も含む。
+評価対象の窓を重複させず、異なる実験で集めた正解ラベルと判定結果を対応付ける。
 合成データのテスト成功を、姿勢識別精度の確認として扱わない。
 
 ## 8. 登録管理エッジの開発用セットアップ
