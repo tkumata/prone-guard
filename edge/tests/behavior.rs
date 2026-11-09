@@ -164,7 +164,7 @@ fn depth_motion_candidate_requires_multiple_valid_changed_cells() {
         let mut distance = m.depth.distance.unwrap();
         for y in 0..4 {
             for x in 0..4 {
-                distance[y][x] += 200;
+                distance[y][x] += 400;
             }
         }
         m.depth.distance = Some(distance);
