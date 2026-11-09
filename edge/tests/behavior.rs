@@ -174,6 +174,8 @@ fn depth_motion_candidate_requires_multiple_valid_changed_cells() {
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0]["start"], START + 79);
     assert_eq!(candidates[0]["end"], START + 80);
+    assert_eq!(candidates[0]["surroundings"]["before"]["valid_depth_frames"], 10);
+    assert_eq!(candidates[0]["surroundings"]["after"]["valid_depth_frames"], 10);
 }
 
 #[test]

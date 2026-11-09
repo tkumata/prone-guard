@@ -41,6 +41,7 @@ pub fn request(window: &Window, end: i64, installation: &Value) -> Result<Value>
                 "Use the time-ordered observations before and after each candidate change, including a roll that is later reversed. ",
                 "Use the depth maps, target status and installation description to assess torso orientation. ",
                 "Inspect depth_change_candidates as possible movement intervals but independently verify torso orientation before and after each candidate using the raw observations. ",
+                "Compare depth and face summaries before and after a candidate, but treat a missing surrounding interval as insufficient evidence. ",
                 "An empty candidate list does not prove absence of rollover. ",
                 "Use temporal features to examine persistent geometric changes and compare both sides of candidate intervals. ",
                 "Use face detection, face location, confidence and landmarks as supporting evidence only; they do not measure torso pose. ",
@@ -96,6 +97,48 @@ pub fn temporal_features(window: &Window) -> Vec<Value> {
     }).collect()
 }
 
+// Compare short intervals on either side of a motion candidate; never infer body side.
+fn compare_candidate_sides(window: &Window, start: i64, end: i64) -> Value {
+    fn summarize(window: &Window, from: i64, to: i64) -> Value {
+        let subset: Vec<_> = window.rows.iter()
+            .filter(|m| m.timestamp >= from && m.timestamp < to).collect();
+        let mut distances: Vec<i64> = Vec::new();
+        let mut faces = 0usize;
+        let mut valid_frames = 0usize;
+        let mut face_x_sum = 0i64;
+        let mut face_x_count = 0i64;
+        for m in &subset {
+            if m.camera.face_detected == Some(1) {
+                faces += 1;
+            }
+            if let Some([x0, _, x1, _]) = m.camera.face_box {
+                face_x_sum += i64::from(x0 + x1);
+                face_x_count += 2;
+            }
+            if let (Some(depth), Some(status)) = (&m.depth.distance, &m.depth.target_status) {
+                let sample: Vec<i64> = (0..8).flat_map(|y| (0..8).filter_map(move |x| {
+                    (status[y][x] == 5).then_some(i64::from(depth[y][x]))
+                })).collect();
+                if sample.len() >= 12 {
+                    valid_frames += 1;
+                    distances.extend(sample);
+                }
+            }
+        }
+        distances.sort_unstable();
+        json!({
+            "frames":subset.len(), "valid_depth_frames":valid_frames,
+            "median_depth_mm":distances.get(distances.len()/2),
+            "face_visible_frames":faces,
+            "face_center_x":if face_x_count > 0 {Some(face_x_sum / face_x_count)} else {None}
+        })
+    }
+    json!({
+        "before":summarize(window, start - 10, start),
+        "after":summarize(window, end + 1, end + 11)
+    })
+}
+
 // Highlight depth motion without classifying motion as a rollover.
 pub fn depth_change_candidates(window: &Window) -> Vec<Value> {
     let mut candidates = Vec::new();
@@ -148,6 +191,11 @@ pub fn depth_change_candidates(window: &Window) -> Vec<Value> {
                 "changed_cells":changed
             }));
         }
+    }
+    for candidate in &mut candidates {
+        let start = candidate["start"].as_i64().unwrap_or(0);
+        let end = candidate["end"].as_i64().unwrap_or(start);
+        candidate["surroundings"] = compare_candidate_sides(window, start, end);
     }
     candidates
 }
