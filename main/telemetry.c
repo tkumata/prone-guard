@@ -87,10 +87,10 @@ char *telemetry_encode(const sensor_observation_t *o, const char *boot_id, const
                          o->face_box[2] <= 320 && o->face_box[3] <= 240 &&
                          o->face_box[2] > o->face_box[0] &&
                          o->face_box[3] > o->face_box[1];
-        ok = ok && box_valid &&
-             cJSON_AddNumberToObject(camera, "face_confidence", o->face_confidence) &&
+        if (box_valid)
+            ok = ok && cJSON_AddNumberToObject(camera, "face_confidence", o->face_confidence) &&
              add(camera, "face_box", cJSON_CreateIntArray(o->face_box, 4));
-        if (o->face_landmarks_valid)
+        if (box_valid && o->face_landmarks_valid)
         {
             cJSON *points = cJSON_CreateArray();
             if (!points)

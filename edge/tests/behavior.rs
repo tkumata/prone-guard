@@ -419,7 +419,7 @@ async fn insufficient_data_skips_the_external_api_and_records_unjudgeable() {
         .unwrap();
     let value: Value = serde_json::from_str(&result).unwrap();
     assert_eq!(value["status"], "unjudgeable");
-    assert_eq!(value["question_version"], "sensor-rollover-v1");
+    assert_eq!(value["question_version"], "sensor-rollover-v2");
     assert!(
         value["reason"]
             .as_str()
