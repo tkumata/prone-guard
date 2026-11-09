@@ -200,7 +200,91 @@ pub struct Window {
     pub max_gap: usize,
 }
 
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct QualityReport {
+    pub valid_seconds: usize,
+    pub max_gap_seconds: usize,
+    pub stale_latest: bool,
+    pub missing_seconds: usize,
+    pub camera_error: usize,
+    pub depth_error: usize,
+    pub no_valid_depth: usize,
+    pub clock_skew: usize,
+    pub received_late: usize,
+    pub duplicate_seconds: usize,
+}
+
+impl QualityReport {
+    pub fn ready(&self) -> bool {
+        self.valid_seconds >= 162 && self.max_gap_seconds <= 5 && !self.stale_latest
+    }
+
+    pub fn reason(&self) -> &'static str {
+        if self.valid_seconds < 162 {
+            "insufficient_valid_seconds"
+        } else if self.max_gap_seconds > 5 {
+            "excessive_observation_gap"
+        } else if self.stale_latest {
+            "stale_latest"
+        } else {
+            "ready"
+        }
+    }
+}
+
+pub fn quality_report(rows: &[Received], end: i64) -> QualityReport {
+    let mut seconds = BTreeMap::new();
+    let mut report = QualityReport {
+        valid_seconds: 0, max_gap_seconds: 0, stale_latest: true,
+        missing_seconds: 0, camera_error: 0, depth_error: 0,
+        no_valid_depth: 0, clock_skew: 0, received_late: 0,
+        duplicate_seconds: 0,
+    };
+    for row in rows {
+        let m = &row.measurement;
+        if m.timestamp < end - PERIOD || m.timestamp >= end {
+            continue;
+        }
+        if seconds.contains_key(&m.timestamp) {
+            report.duplicate_seconds += 1;
+            continue;
+        }
+        if m.camera.status != SensorStatus::Ok {
+            report.camera_error += 1;
+        }
+        if m.depth.status != SensorStatus::Ok {
+            report.depth_error += 1;
+        }
+        if m.depth.target_status.as_ref().is_none_or(|map| !map.iter().flatten().any(|s| *s == 5)) {
+            report.no_valid_depth += 1;
+        }
+        if m.camera.timestamp.zip(m.depth.timestamp).is_none_or(|(a, b)| a.abs_diff(b) > 1) {
+            report.clock_skew += 1;
+        }
+        if !(-5..=5).contains(&(row.received_at - m.timestamp)) {
+            report.received_late += 1;
+        }
+        seconds.insert(m.timestamp, m.usable(row.received_at));
+    }
+    let mut gap = 0usize;
+    let mut last_good = None;
+    for second in end - PERIOD..end {
+        if seconds.get(&second) == Some(&true) {
+            report.valid_seconds += 1;
+            gap = 0;
+            last_good = Some(second);
+        } else {
+            gap += 1;
+            report.missing_seconds += 1;
+        }
+        report.max_gap_seconds = report.max_gap_seconds.max(gap);
+    }
+    report.stale_latest = last_good.is_none_or(|last| end - last > 5);
+    report
+}
+
 pub fn prepare_window(rows: Vec<Received>, end: i64) -> Result<Window> {
+    let report = quality_report(&rows, end);
     let mut seconds = BTreeMap::new();
     for row in rows {
         let m = row.measurement;
@@ -218,17 +302,7 @@ pub fn prepare_window(rows: Vec<Received>, end: i64) -> Result<Window> {
         };
         max_gap = max_gap.max(gap);
     }
-    ensure!(
-        seconds.len() >= 162 && max_gap <= 5,
-        "insufficient_data: valid_seconds={} max_gap={max_gap}",
-        seconds.len()
-    );
-    ensure!(
-        seconds
-            .last_key_value()
-            .is_some_and(|(last, _)| end - last <= 5),
-        "insufficient_data: stale_latest"
-    );
+    ensure!(report.ready(), "insufficient_data: {}", report.reason());
     Ok(Window {
         valid_seconds: seconds.len(),
         rows: seconds.into_values().collect(),
