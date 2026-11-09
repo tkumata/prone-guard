@@ -126,6 +126,35 @@ fn missing_data_duplicates_and_staleness_do_not_pass_quality_gate() {
 }
 
 #[test]
+fn quality_report_explains_skipped_observations() {
+    let end = START + 180;
+    let mut data = rows(end);
+    data[30].measurement.camera.status = measurement::SensorStatus::Error;
+    data[31].measurement.depth.status = measurement::SensorStatus::Error;
+    data[32].measurement.depth.target_status = Some([[6; 8]; 8]);
+    data[33].received_at += 10;
+    let report = measurement::quality_report(&data, end);
+    assert_eq!(report.camera_error, 1);
+    assert_eq!(report.depth_error, 1);
+    assert_eq!(report.no_valid_depth, 1);
+    assert_eq!(report.received_late, 1);
+    assert_eq!(report.valid_seconds, 176);
+    assert!(report.ready());
+}
+
+#[test]
+fn temporal_features_do_not_invent_body_orientation() {
+    let end = START + 180;
+    let window = measurement::prepare_window(rows(end), end).unwrap();
+    let features = jev::temporal_features(&window);
+    assert_eq!(features.len(), 180);
+    assert_eq!(features[0]["valid_cells"], 64);
+    assert_eq!(features[0]["median_distance_mm"], 1000);
+    assert_eq!(features[0]["adjacent_gradient_mm"], 0);
+    assert!(features[0].get("torso_orientation").is_none());
+}
+
+#[test]
 fn depth_motion_candidate_requires_multiple_valid_changed_cells() {
     let end = START + 180;
     let mut data = rows(end);
@@ -190,6 +219,7 @@ fn jev_rollover_request_contains_the_ordered_window_and_excludes_device_identity
         );
     }
     assert!(request["state"]["depth_change_candidates"].is_array());
+    assert_eq!(request["state"]["temporal_features"].as_array().unwrap().len(), 180);
     assert_eq!(request["state"]["window"]["start"], START);
     assert_eq!(request["state"]["window"]["end_exclusive"], START + 180);
     let questions = request["questions"].as_object().unwrap();
@@ -210,7 +240,7 @@ fn answer() -> Value {
 fn jev_validates_rollover_results_and_preserves_uncertainty() {
     let detected = jev::parse(&answer()).unwrap();
     assert_eq!(detected["status"], "rollover_detected");
-    assert_eq!(detected["question_version"], "sensor-rollover-v2");
+    assert_eq!(detected["question_version"], "sensor-rollover-v3");
     let mut response = answer();
     response["answers"]["rollover"]["choice"] = json!("no_rollover");
     response["answers"]["rollover"]["probabilities"] =
@@ -419,7 +449,7 @@ async fn insufficient_data_skips_the_external_api_and_records_unjudgeable() {
         .unwrap();
     let value: Value = serde_json::from_str(&result).unwrap();
     assert_eq!(value["status"], "unjudgeable");
-    assert_eq!(value["question_version"], "sensor-rollover-v2");
+    assert_eq!(value["question_version"], "sensor-rollover-v3");
     assert!(
         value["reason"]
             .as_str()

@@ -237,8 +237,11 @@ pub async fn judge(
         }
     })
     .await;
+    let mut quality = None;
     let mut result = match rows {
-        Ok(Ok(rows)) => match measurement::prepare_window(rows, end) {
+        Ok(Ok(rows)) => {
+            quality = Some(json!(measurement::quality_report(&rows, end)));
+            match measurement::prepare_window(rows, end) {
             Ok(_) if key.is_none() => json!({"status":"unjudgeable","reason":"jev_not_configured"}),
             Ok(window) => match jev::request(&window, end, &device.installation) {
                 Ok(request) => match tokio::time::timeout(
@@ -251,17 +254,26 @@ pub async fn judge(
                         app.jev_available.store(true, Ordering::Relaxed);
                         result
                     }
+                    Ok(Err(error)) => {
+                        app.jev_available.store(false, Ordering::Relaxed);
+                        eprintln!("{}", json!({"event":"jev_error","bed_id":bed,"error":error.to_string()}));
+                        json!({"status":"unjudgeable","reason":"jev_failed"})
+                    }
                     _ => {
                         app.jev_available.store(false, Ordering::Relaxed);
-                        json!({"status":"unjudgeable","reason":"jev_failed_or_expired"})
+                        json!({"status":"unjudgeable","reason":"jev_timeout_or_expired"})
                     }
                 },
                 Err(_) => json!({"status":"unjudgeable","reason":"input_too_large"}),
             },
             Err(error) => json!({"status":"unjudgeable","reason":error.to_string()}),
-        },
+            }
+        }
         _ => json!({"status":"unjudgeable","reason":"storage_error"}),
     };
+    if let Some(report) = quality {
+        result["quality"] = report;
+    }
     result["requested_model"] = json!(jev::MODEL);
     result["question_version"] = json!(jev::QUESTION_VERSION);
     eprintln!(
