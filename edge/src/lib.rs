@@ -13,9 +13,9 @@ use anyhow::Result;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, FromRequest, Request, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde_json::json;
@@ -54,6 +54,20 @@ pub fn router(app: Arc<App>) -> Router {
         .with_state(app)
 }
 
+struct TimedBody<T>(T);
+
+impl<S: Sync, T: FromRequest<S>> FromRequest<S> for TimedBody<T> {
+    type Rejection = Response;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        tokio::time::timeout(Duration::from_secs(5), T::from_request(request, state))
+            .await
+            .map_err(|_| StatusCode::REQUEST_TIMEOUT.into_response())?
+            .map(Self)
+            .map_err(IntoResponse::into_response)
+    }
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PairingCheck {
@@ -66,7 +80,7 @@ struct PairingCheck {
 async fn pairing_check(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
-    Json(check): Json<PairingCheck>,
+    TimedBody(Json(check)): TimedBody<Json<PairingCheck>>,
 ) -> impl IntoResponse {
     let Some(authorization) = headers
         .get("Authorization")
@@ -134,7 +148,7 @@ async fn health(State(app): State<Arc<App>>) -> impl IntoResponse {
 async fn receive(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
-    body: Bytes,
+    TimedBody(body): TimedBody<Bytes>,
 ) -> impl IntoResponse {
     let Some(authorization) = headers
         .get("Authorization")

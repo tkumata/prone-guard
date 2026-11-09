@@ -2,13 +2,12 @@
 name = "prone-guard-edge"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99"
 
 [dependencies]
 anyhow = "1.0.104"
 axum = "0.8.9"
-axum-server = { version = "0.8.0", features = ["tls-rustls"] }
-mdns-sd = "=0.21.6"
+axum-server = { version = "0.9.0", features = ["tls-rustls"] }
+mdns-sd = "=0.21.7"
 prost = "0.14"
 rcgen = { version = "=0.14.10", default-features = false, features = [
     "ring",

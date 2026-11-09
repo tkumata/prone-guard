@@ -1,9 +1,10 @@
 use anyhow::{Result, ensure};
-use mdns_sd::{DaemonEvent, ServiceDaemon, ServiceInfo};
+use mdns_sd::{DaemonEvent, Receiver, ServiceDaemon, ServiceInfo};
 use std::time::Duration;
 
 pub struct Discovery {
     daemon: ServiceDaemon,
+    events: Receiver<DaemonEvent>,
     fullname: String,
 }
 
@@ -12,22 +13,33 @@ impl Discovery {
         let service = service(id, port)?;
         let fullname = service.get_fullname().to_owned();
         let daemon = ServiceDaemon::new()?;
-        daemon.register(service)?;
-        Ok(Self { daemon, fullname })
+        let events = daemon.monitor()?;
+        let discovery = Self {
+            daemon,
+            events,
+            fullname,
+        };
+        discovery.daemon.register(service)?;
+        Ok(discovery)
     }
 
-    pub async fn monitor(&self) -> Result<()> {
-        let monitor = self.daemon.monitor()?;
-        while let Ok(event) = monitor.recv_async().await {
-            match event {
-                DaemonEvent::NameChange(_) => {
-                    anyhow::bail!("mDNS name conflict; original TLS identity retained")
+    pub async fn monitor(self) {
+        let reason = loop {
+            match self.events.recv_async().await {
+                Ok(DaemonEvent::NameChange(_)) => {
+                    break "mDNS name conflict; original TLS identity retained";
                 }
-                DaemonEvent::Error(_) => anyhow::bail!("mDNS advertisement failed"),
-                _ => {}
+                Ok(DaemonEvent::Error(_)) => break "mDNS advertisement failed",
+                Ok(_) => {}
+                Err(_) => break "mDNS daemon stopped",
             }
-        }
-        anyhow::bail!("mDNS daemon stopped")
+        };
+        eprintln!(
+            "{}",
+            serde_json::json!({"event":"mdns_advertisement_failed","reason":reason})
+        );
+        // Dropping Discovery waits for the daemon, so do not block a runtime worker.
+        tokio::task::spawn_blocking(move || drop(self));
     }
 }
 
