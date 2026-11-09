@@ -243,34 +243,34 @@ pub async fn judge(
         Ok(Ok(rows)) => {
             quality = Some(json!(measurement::quality_report(&rows, end)));
             match measurement::prepare_window(rows, end) {
-            Ok(_) if key.is_none() => json!({"status":"unjudgeable","reason":"jev_not_configured"}),
-            Ok(window) => {
-                candidate_intervals = Some(json!(jev::depth_change_candidates(&window)));
-                match jev::request(&window, end, &device.installation) {
-                Ok(request) => match tokio::time::timeout(
-                    Duration::from_secs(30),
-                    jev::classify(&client, key.as_ref().as_ref().unwrap(), &request),
-                )
-                .await
-                {
-                    Ok(Ok(result)) if now() < end + measurement::PERIOD => {
-                        app.jev_available.store(true, Ordering::Relaxed);
-                        result
+                Ok(_) if key.is_none() => json!({"status":"unjudgeable","reason":"jev_not_configured"}),
+                Ok(window) => {
+                    candidate_intervals = Some(json!(jev::depth_change_candidates(&window)));
+                    match jev::request(&window, end, &device.installation) {
+                    Ok(request) => match tokio::time::timeout(
+                        Duration::from_secs(30),
+                        jev::classify(&client, key.as_ref().as_ref().unwrap(), &request),
+                    )
+                    .await
+                    {
+                        Ok(Ok(result)) if now() < end + measurement::PERIOD => {
+                            app.jev_available.store(true, Ordering::Relaxed);
+                            result
+                        }
+                        Ok(Err(error)) => {
+                            app.jev_available.store(false, Ordering::Relaxed);
+                            eprintln!("{}", json!({"event":"jev_error","bed_id":bed,"error":error.to_string()}));
+                            json!({"status":"unjudgeable","reason":"jev_failed"})
+                        }
+                        _ => {
+                            app.jev_available.store(false, Ordering::Relaxed);
+                            json!({"status":"unjudgeable","reason":"jev_timeout_or_expired"})
+                        }
+                    },
+                    Err(_) => json!({"status":"unjudgeable","reason":"input_too_large"}),
                     }
-                    Ok(Err(error)) => {
-                        app.jev_available.store(false, Ordering::Relaxed);
-                        eprintln!("{}", json!({"event":"jev_error","bed_id":bed,"error":error.to_string()}));
-                        json!({"status":"unjudgeable","reason":"jev_failed"})
-                    }
-                    _ => {
-                        app.jev_available.store(false, Ordering::Relaxed);
-                        json!({"status":"unjudgeable","reason":"jev_timeout_or_expired"})
-                    }
-                },
-                Err(_) => json!({"status":"unjudgeable","reason":"input_too_large"}),
-                }
             }
-            Err(error) => json!({"status":"unjudgeable","reason":error.to_string()}),
+                Err(error) => json!({"status":"unjudgeable","reason":error.to_string()}),
             }
         }
         _ => json!({"status":"unjudgeable","reason":"storage_error"}),
