@@ -238,12 +238,15 @@ pub async fn judge(
     })
     .await;
     let mut quality = None;
+    let mut candidate_intervals = None;
     let mut result = match rows {
         Ok(Ok(rows)) => {
             quality = Some(json!(measurement::quality_report(&rows, end)));
             match measurement::prepare_window(rows, end) {
             Ok(_) if key.is_none() => json!({"status":"unjudgeable","reason":"jev_not_configured"}),
-            Ok(window) => match jev::request(&window, end, &device.installation) {
+            Ok(window) => {
+                candidate_intervals = Some(json!(jev::depth_change_candidates(&window)));
+                match jev::request(&window, end, &device.installation) {
                 Ok(request) => match tokio::time::timeout(
                     Duration::from_secs(30),
                     jev::classify(&client, key.as_ref().as_ref().unwrap(), &request),
@@ -265,7 +268,8 @@ pub async fn judge(
                     }
                 },
                 Err(_) => json!({"status":"unjudgeable","reason":"input_too_large"}),
-            },
+                }
+            }
             Err(error) => json!({"status":"unjudgeable","reason":error.to_string()}),
             }
         }
@@ -273,6 +277,9 @@ pub async fn judge(
     };
     if let Some(report) = quality {
         result["quality"] = report;
+    }
+    if let Some(intervals) = candidate_intervals {
+        result["depth_motion_candidates"] = intervals;
     }
     result["requested_model"] = json!(jev::MODEL);
     result["question_version"] = json!(jev::QUESTION_VERSION);

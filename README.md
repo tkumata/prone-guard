@@ -261,9 +261,12 @@ curl --fail --cacert edge/local/ca.pem https://192.168.1.50:8443/health
 
 `"receiver":"ready"` はエッジの受付と保存領域が使用可能な状態です。
 Jev の判定結果は、エッジを起動したターミナルの標準エラーに、3 分周期で `posture_result` として出ます。
-`sensor-rollover-v1` の `status` は `rollover_detected`、`no_rollover`、`unjudgeable` のいずれかです。
+`sensor-rollover-v3` の `status` は `rollover_detected`、`no_rollover`、`unjudgeable` のいずれかです。
 十分な観測が揃った周期で API を呼び出します。キーがない場合は、十分な観測があっても `jev_not_configured` を記録します。
 Jev の実 API と寝返りの検出精度は、セットアップの接続確認とは別に検証します。
+各 `posture_result` の `quality` は観測不足の原因別件数を、`depth_motion_candidates` は寝返りを確定しない動作候補を示します。
+実測の検知率と判定不能率は `python3 tools/evaluate_rollover.py labels.csv edge.log.jsonl` で評価できます。
+正解CSVの形式は [寝返り評価手順](docs/plans/completed/2026-11-09-rollover-observation.md) を参照してください。
 
 通常の再起動では、マイコンへ給電し、エッジのリポジトリルートで次を実行します。
 再ビルド・eFuse 書込み・USB 初期設定は不要です。Jev を使う場合は、そのターミナルにも `JEV_API_KEY` を設定してください。
