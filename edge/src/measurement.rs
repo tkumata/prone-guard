@@ -19,6 +19,12 @@ pub struct Camera {
     pub status: SensorStatus,
     pub face_detected: Option<u8>,
     pub face_area_px2: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub face_confidence: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub face_box: Option<[i32; 4]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub face_landmarks: Option<[[i32; 2]; 5]>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -93,11 +99,39 @@ impl Measurement {
                     ),
                     "inconsistent face detection"
                 );
+                let camera = &self.camera;
+                ensure!(
+                    camera.face_confidence.is_some() == camera.face_box.is_some(),
+                    "incomplete face metadata"
+                );
+                if let (Some(confidence), Some([x0, y0, x1, y1])) =
+                    (camera.face_confidence, camera.face_box)
+                {
+                    ensure!(
+                        camera.face_detected == Some(1)
+                            && confidence.is_finite()
+                            && (0.0..=1.0).contains(&confidence)
+                            && x0 >= 0 && y0 >= 0 && x1 <= 320 && y1 <= 240
+                            && x1 > x0 && y1 > y0
+                            && (f64::from(x1 - x0) * f64::from(y1 - y0) - area).abs() < 0.01,
+                        "invalid face metadata"
+                    );
+                }
+                if let Some(points) = camera.face_landmarks {
+                    ensure!(
+                        camera.face_box.is_some()
+                            && points.iter().all(|[x, y]| (0..=320).contains(x) && (0..=240).contains(y)),
+                        "invalid face landmarks"
+                    );
+                }
             }
             SensorStatus::Error => ensure!(
                 self.camera.timestamp.is_none()
                     && self.camera.face_detected.is_none()
-                    && self.camera.face_area_px2.is_none(),
+                    && self.camera.face_area_px2.is_none()
+                    && self.camera.face_confidence.is_none()
+                    && self.camera.face_box.is_none()
+                    && self.camera.face_landmarks.is_none(),
                 "camera errors must use null"
             ),
         }

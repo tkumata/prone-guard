@@ -126,6 +126,42 @@ fn missing_data_duplicates_and_staleness_do_not_pass_quality_gate() {
 }
 
 #[test]
+fn depth_motion_candidate_requires_multiple_valid_changed_cells() {
+    let end = START + 180;
+    let mut data = rows(end);
+    assert!(jev::depth_change_candidates(&measurement::prepare_window(rows(end), end).unwrap()).is_empty());
+    for row in data.iter_mut().skip(80) {
+        let m = &mut row.measurement;
+        let mut distance = m.depth.distance.unwrap();
+        for y in 0..4 {
+            for x in 0..4 {
+                distance[y][x] += 200;
+            }
+        }
+        m.depth.distance = Some(distance);
+    }
+    let window = measurement::prepare_window(data, end).unwrap();
+    let candidates = jev::depth_change_candidates(&window);
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0]["start"], START + 79);
+    assert_eq!(candidates[0]["end"], START + 80);
+}
+
+#[test]
+fn optional_face_metadata_is_validated() {
+    let mut m = sample(START);
+    m.camera.face_confidence = Some(0.8);
+    assert!(m.validate(START).is_err());
+    m.camera.face_box = Some([10, 10, 20, 20]);
+    m.camera.face_area_px2 = Some(100.0);
+    m.validate(START).unwrap();
+    m.camera.face_landmarks = Some([[10, 10]; 5]);
+    m.validate(START).unwrap();
+    m.camera.face_landmarks = Some([[400, 10]; 5]);
+    assert!(m.validate(START).is_err());
+}
+
+#[test]
 fn jev_rollover_request_contains_the_ordered_window_and_excludes_device_identity() {
     let window = measurement::prepare_window(rows(START + 180), START + 180).unwrap();
     let request = jev::request(&window, START + 180, &json!({"mount":"overhead"})).unwrap();
@@ -153,6 +189,7 @@ fn jev_rollover_request_contains_the_ordered_window_and_excludes_device_identity
             json!(expected.depth.target_status)
         );
     }
+    assert!(request["state"]["depth_change_candidates"].is_array());
     assert_eq!(request["state"]["window"]["start"], START);
     assert_eq!(request["state"]["window"]["end_exclusive"], START + 180);
     let questions = request["questions"].as_object().unwrap();
@@ -173,7 +210,7 @@ fn answer() -> Value {
 fn jev_validates_rollover_results_and_preserves_uncertainty() {
     let detected = jev::parse(&answer()).unwrap();
     assert_eq!(detected["status"], "rollover_detected");
-    assert_eq!(detected["question_version"], "sensor-rollover-v1");
+    assert_eq!(detected["question_version"], "sensor-rollover-v2");
     let mut response = answer();
     response["answers"]["rollover"]["choice"] = json!("no_rollover");
     response["answers"]["rollover"]["probabilities"] =
@@ -181,6 +218,7 @@ fn jev_validates_rollover_results_and_preserves_uncertainty() {
     assert_eq!(jev::parse(&response).unwrap()["status"], "no_rollover");
     response["answers"]["rollover"]["confidence"] = json!(0.899);
     assert_eq!(jev::parse(&response).unwrap()["status"], "unjudgeable");
+    assert_eq!(jev::parse(&response).unwrap()["decision_reason"], "low_model_confidence");
     let mut unexpected = answer();
     unexpected["answers"]["rollover"]["echoed_input"] = json!("private sensor information");
     assert!(
