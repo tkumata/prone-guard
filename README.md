@@ -11,6 +11,10 @@ Freenove ESP32-S3 WROOM CAM と スイッチサイエンス Conta 基板 (VL53L5
 - 管理画面: HTTPS とデバイス固有の管理者認証。
 - ST7735 (128×160px) に深度マップを各ゾーン 16×16px、64 階調で表示します。下部に文字を 2 行表示します。
 
+## 注意
+
+本プロジェクトの各種資料に「商品」という単語が出てきますが、仮に商品化した場合の想定であり、現行の実装は開発用です。
+
 ## 構成
 
 ![prone-guard のアーキテクチャ](./docs/images/prone-guard-architecture.png)
@@ -75,7 +79,7 @@ cd prone-guard
 **以降のコマンドは、特記がなければ全てこのルート (`README.md` があるディレクトリ) で実行します。**
 新しいターミナルを使う場合も、このルートへ移動してください。
 
-**ESP-IDF の環境有効化は `setup.py` が行います。手動で `source export.sh` や activate を実行する必要はありません。**
+**ESP-IDF の環境有効化は `setup.py` が行います。手動で `source export.sh` や `activate.sh` を実行する必要はありません。**
 スクリプトは次の順で SDK を決め、必ずその SDK の `export.sh` を読み込みます。
 
 1. 環境変数 `IDF_PATH` がある場合は、その SDK を使う。
@@ -255,8 +259,8 @@ sudo update-ca-certificates
 別のターミナルで HTTPS 受付を確認する場合は、同じリポジトリルートから次を実行します。IP は設定したエッジの IP へ置き換えます。
 
 ```sh
-curl --fail --cacert edge/local/ca.pem https://192.168.1.50:8443/health
 # IP アドレスはエッジコンピュータの IP アドレスに置き換えてください
+curl --fail --cacert edge/local/ca.pem https://192.168.1.50:8443/health
 ```
 
 `"receiver":"ready"` はエッジの受付と保存領域が使用可能な状態です。
@@ -314,7 +318,7 @@ RGB666 の 64 階調を使い、各画素の明るさで距離を表します。
 下部 32px には、文字を 2 行表示します。
 1 行目は 6×16px の文字でマップ全体の状態と顔検知結果、
 2 行目は 8×16px の文字で凡例 `0-4m NEAR=WHITE` を表示します。
-顔検知時は `DEPTH / FACE ■ 12` と表示し、`■` は緑、面積は白です。
+顔検知時は `DEPTH / FACE ■ 12439` と表示し、`■` は緑、面積は白です。
 面積は 320×240 の座標系における顔矩形の面積を整数の px² で表示します (最大 76800) 。
 未検知・カメラ未取得・取得失敗時は `DEPTH / FACE x` と表示し、`x` は赤です。
 `NO DATA`・`NO VALID` では、画面内に収めるため `/` 前後の空白を省きます。
@@ -376,4 +380,4 @@ USB・配線・電源・センサーの方向・実 API の識別精度は実機
 - [要件](docs/current/REQUIREMENTS.md)
 - [仕様](docs/current/SPECIFICATIONS.md)
 - [設計](docs/current/DESIGN.md)
-- [商品向けの接続・登録設計](docs/current/CONNECTION.md)
+- [接続・登録設計](docs/current/CONNECTION.md)
