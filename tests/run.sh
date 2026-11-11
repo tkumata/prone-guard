@@ -18,6 +18,12 @@ cc -std=c11 -Wall -Wextra -Werror -Wno-deprecated-declarations -fsanitize=addres
   managed_components/espressif__cjson/cJSON/cJSON.c tests/test_monitor_settings.c \
   -lm -o "$test_binary"
 "$test_binary"
+cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined \
+  -Itests/fakes -I"${IDF_BUILD_DIR:-build}/config" -Imain \
+  -I"$IDF_PATH/components/esp_common/include" \
+  -I"$IDF_PATH/components/mbedtls/mbedtls/tf-psa-crypto/include" \
+  main/device_security_store.c tests/test_device_security_store.c -o "$test_binary"
+"$test_binary"
 cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -Imain \
   main/pairing_frame.c tests/test_pairing_frame.c -o "$test_binary"
 "$test_binary"

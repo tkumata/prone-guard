@@ -21,6 +21,9 @@ Content-Type は `application/x-ndjson` とし、末尾に改行を付ける。
 | `camera.timestamp` | 顔検知を完了した UTC Unix 秒 |
 | `camera.face_detected` | 0 または 1 |
 | `camera.face_area_px2` | 320×240 でクリップした顔矩形の幅×高さ |
+| `camera.face_confidence` | 顔検出時のみ。顔検出スコアであり寝返りの確率ではない |
+| `camera.face_box` | 顔検出時のみ。元画像の `[x0,y0,x1,y1]` |
+| `camera.face_landmarks` | 取得できた場合のみ。5 点の `[x,y]` 配列 |
 | `depth.status` | `ok` または `error` |
 | `depth.timestamp` | 測距結果を取得した UTC Unix 秒 |
 | `depth.distance` | 符号付き 16bit 整数の 8×8 配列、mm |
@@ -100,7 +103,7 @@ ID と取引 ID は文字列、世代は符号なし 32bit 整数とする。
 ### GET /health
 
 受付と DB の準備状態を返す。
-この API は、キー、ベッド一覧、観測、姿勢判定を返さない。
+この API は、キー、ベッド一覧、観測、判定結果を返さない。
 準備済みは `200`、保存系が利用不能なら `503` とする。
 Jev の欄は最後の通信状態であり、Jev の常時監視ではない。
 Jev の未設定・失敗だけでは受付を停止しない。
@@ -122,31 +125,57 @@ Jev の未設定・失敗だけでは受付を停止しない。
 - 各有効観測の深度に、少なくとも 1 セルの status `5` がある。
 
 顔未検知はデータ不足を意味しない。
-不足時は `insufficient_data` と区間数・欠測秒数をログへ記録する。
+顔の任意項目がない従来の観測JSONLも受け付ける。
+顔が検出された場合でも、顔の移動だけで胴体の寝返りを確定しない。
+品質条件を満たさない場合は `insufficient_data` と具体的な理由を記録する。
+`quality` には `valid_seconds`、`max_gap_seconds`、`stale_latest`、`missing_seconds`、`camera_error`、`depth_error`、`no_valid_depth`、`clock_skew`、`received_late`、`duplicate_seconds` を格納する。
+原因別件数は重複し得る。欠測秒数には送信されなかった秒と品質条件を満たさない秒の両方を含める。
+品質診断では同一秒の最初の観測を集計する。判定入力は保存された同一秒の最新観測を使うため、重複観測がある場合は品質診断と判定入力の選択が異なることがある。
 後続の周期で十分なデータが揃った場合は送信を再開する。
 受付と保存、他ベッドの判定は継続する。
 
 Jev のモデルは `jev-1.14.0` に固定する。
-質問の版は `sensor-posture-v1` とする。
+質問の版は `sensor-rollover-v3` とする。
 JSON の state に、生の観測 JSONL、設置情報、計算済み品質情報を渡す。
+観測 JSONL は、顔検出の有無、顔の bounding box 面積、8×8 の深度とセル状態を時刻順に含む。
 外部へ送る JSONL から、ベッド ID と起動 ID を除外する。
 長文用ヘッダ `TypeSafe-Danger-Zone-Long-Context: true` を付ける。
 生成した観測 JSONL は 200,000 bytes までとする。
 上限超過時は間引かず、`input_too_large` を記録する。
 実際の token 上限は別に実 API で確認する。
 
-Choice は `prone / not_prone / unjudgeable` の 3 択とする。
-質問は、期間末尾の胴体と支持面の関係を対象にする。
-顔の有無や頭の向きだけで胴体姿勢を推定させない。
-confidence が 0.9 未満の場合は、判定不能として扱う。
+Jev への質問は、対象期間内に寝返りがあったかを尋ねる。
+寝返りは、横になった人が胴体を回転させ、支持面に対する向きを変えることとする。
+対象期間内に元の姿勢へ戻った場合も、寝返りとして数える。
+Choice は `rollover_detected / no_rollover / unjudgeable` の 3 択とする。
+顔検出の有無、顔の面積、顔矩形とランドマークは深度に基づく判定の補助として使う。
+各観測の有効セル（`target_status == 5`）から、有効セル数、距離中央値、有効セルの格子上の重心、隣接セル間距離差の平均を算出する。
+`temporal_features` に時刻順の特徴量と顔の補助情報を格納し、Jevへ渡す。
+深度が無効な場合は存在しない特徴量を `null` とする。特徴量は胴体の姿勢ラベルではない。
+連続する深度フレームの有効セルから変化候補を算出する。共通有効セル12以上、100mm以上変化したセル6以上、平均絶対差80mm以上を候補条件とする。
+候補は最大16区間とし、5秒以内の近接区間を統合する。候補は寝返りの確定結果ではない。
+候補区間には `start`、`end`、`peak_mean_abs_delta_mm`、`shared_cells`、`changed_cells`、`surroundings` を記録する。
+隣接する2秒間の有効セルを比較し、対象センサの設置向きから姿勢を自動推定しない。
+候補の前後10秒間の深度中央値、顔の可視回数、顔中心座標を比較用の補助情報として渡す。前後の観測が不足する場合は推測しない。
+候補がなくても寝返りなしとは判定しない。Jevは従来どおり生の観測系列も確認する。
+欠測や遮蔽などで動きの前後を確認できず、寝返りの有無を判断できない場合は判定不能とする。
+confidence が 0.9 未満の場合は、判定不能として扱う。生の choice、confidence、probabilities と decision_reason は記録に保持する。
 型、モデル、選択肢、確率の範囲と総和を検証する。
 選択結果と最大確率の選択肢が矛盾する応答は拒否する。
 
 全体の通信期限は 30 秒とする。
 同じ判定窓の再試行は行わない。
 周期は単調増加時計で管理し、過ぎた周期をまとめて実行しない。
-未設定・通信失敗・不正応答・古い応答は、非うつ伏せへ変換しない。
-判定記録には対象期間、判定時刻、モデル、質問の版、回答を残す。
+Jev未設定は `jev_not_configured`、通信・応答エラーは `jev_failed`、期限切れまたはタイムアウトは `jev_timeout_or_expired` として判定不能を記録する。
+品質不足では `insufficient_data`、入力上限超過では `input_too_large`、保存失敗では `storage_error` を記録する。
+Jevが妥当な応答を返した場合、`answer` に `choice`、`confidence`、`probabilities` を保持する。
+信頼度0.9未満では `status` を `unjudgeable`、`decision_reason` を `low_model_confidence` とする。
+それ以外では `decision_reason` を `model_choice` とする。
+判定結果は標準エラーへ `event: posture_result` のJSONで記録する。
+その結果には対象期間、判定時刻、モデル、質問の版、回答、`quality`、`depth_motion_candidates` を含める。
+`depth_motion_candidates` は品質条件が成立し、候補抽出へ到達した場合に記録する。
+判定結果はSQLiteにも保存する。
+既存の `sensor-posture-v1` の記録は、対象期間の末尾の姿勢を表す。
 過去の結果を現在の状態として返す API は追加しない。
 
 ## 4. マイコンの管理 API
@@ -230,7 +259,9 @@ HMAC キーは事前設定済みの eFuse KEY0 を既定として使用する。
 別のブロックを使う場合は `CONFIG_NVS_SEC_HMAC_EFUSE_KEY_ID` を変更する。
 通常のファームウェアは、Wi-Fi 設定、管理 TLS の秘密鍵・証明書、エッジ CA を含む開発用の平文 JSON を USB で受け付ける。
 改行前の入力は 32767 bytes までとし、CR は入力長に含めない。
-保存成功時は `PROVISION_OK` を返して再起動する。USB 初期設定には相手認証や登録受付の制限がない。
+保存成功時は `PROVISION_OK` を返して再起動する。
+設定済み機器の USB 再設定では、入力した管理者パスワードが保存済みの値と一致する場合だけ設定を書き込む。
+パスワード照合なしの初回設定は、セキュリティ情報と設定がどちらも未保存の場合に限る。
 開発時の手順は [環境構築と運用](SETUP.md#開発者向けの現行試作手順) に記載する。
 商品向けの USB 認証と設定の確定は [接続設計](CONNECTION.md) に記載する。
 

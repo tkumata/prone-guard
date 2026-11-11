@@ -17,9 +17,11 @@ flowchart LR
   Snapshot -->|1 秒周期 / 深度マップと顔検知結果| TFT[ST7735]
   Snapshot -->|1 秒周期 / HTTPS JSONL| API[認証・受付]
   API --> SQLite[(SQLite)]
-  SQLite --> Quality[直近 180 秒 / 品質判定]
-  Quality -->|十分な場合だけ| Jev[Jev Choice]
+  SQLite --> Quality[直近 180 秒 / 品質診断と判定]
+  Quality -->|十分な場合だけ| Features[時系列特徴量 / 動作候補 / 前後比較]
+  Features --> Jev[Jev Choice]
   Jev --> Validate[回答検証 / 3 状態]
+  Quality --> Results[ログと SQLite]
   Validate --> Results[ログと SQLite]
 ```
 
@@ -99,14 +101,14 @@ SPI は未接続を検出できないため、描画成功は実機で別途確�
 
 | モジュール | 責務 |
 | --- | --- |
-| `measurement.rs` | 入力の意味、型、品質、180 秒の期間判定 |
+| `measurement.rs` | 入力検証、観測品質の原因別集計、180 秒の期間判定 |
 | `store.rs` | SQLite、重複、保持期間、容量制限 |
 | `config.rs` | 起動設定、秘密ファイル、キーとベッドの対応 |
 | `registration.rs`、`registration_store.rs` | 登録世代と取引の状態管理、登録 DB、準備中の接続確認と失効 |
 | `identity.rs`、`discovery.rs` | エッジの CA と TLS 証明書、mDNS 広告 |
 | `security2.rs`、`pairing.rs` | 検証ツールが使用する Security 2 クライアントと USB 登録フレーム |
-| `jev.rs` | 質問と回答契約、HTTPS 呼出し、応答検証 |
-| `lib.rs` | HTTP とドメインの接続、周期処理、ログ |
+| `jev.rs` | 深度の時系列特徴量、動作候補と前後比較、質問と回答契約、HTTPS 呼出し、応答検証 |
+| `lib.rs` | HTTP とドメインの接続、周期処理、品質診断と候補の記録 |
 | `main.rs` | TLS サーバ起動と終了 |
 
 SQLite 操作は blocking worker 内で行う。
@@ -178,8 +180,13 @@ NVS 初期化失敗でも、領域を自動消去しない。
 ## 8. 判定の責任と限界
 
 Jev には直近 180 秒の数値 JSONL と設置情報を与える。
-顔の有無だけで、胴体姿勢を決める質問にはしない。
-対象期間の末尾を判断させ、過去 3 分の多数決にはしない。
+窓全体の時系列から、横になった人の胴体の向きが変わる寝返りを判断させる。
+深度の有効セルから時系列特徴量を算出する。
+連続する深度フレームの差から候補区間を抽出し、候補の前後10秒間を比較する。
+顔の有無、面積、矩形、検出信頼度とランドマークは補助情報として使う。
+これらの情報だけで胴体の向きや寝返りを確定しない。
 回答形式と信頼度を検証し、不確かな結果は判定不能にする。
 Jev の confidence と、実際の識別精度を同一視しない。
+正解ラベル付きの判定窓と `posture_result` ログは `tools/evaluate_rollover.py` で評価する。
+評価では未判定を独立に数え、検知率、誤検知率、判定不能率、検知遅延を求める。
 実機の設置条件と正解付き観測による評価は別に実施する。

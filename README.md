@@ -1,15 +1,19 @@
 # prone-guard
 
-Freenove ESP32-S3 WROOM CAM と VL53L5CX から、顔検知と 8×8 深度を毎秒送信する試作システムです。
-エッジ側の Rust アプリは、認証済みの観測を SQLite に保存します。
-3 分ごとに直近 3 分のデータを評価し、品質条件を満たす場合に Jev へ送ります。うつ伏せ / 非うつ伏せ / 判定不能を記録します。
+Freenove ESP32-S3 WROOM CAM と スイッチサイエンス Conta 基板 (VL53L5CX 搭載) から、顔検知と 8×8 ゾーンの深度をエッジコンピュータのアプリに毎秒送信します。
+エッジコンピュータ側のアプリは、認証済みのセンサー端末の観測を SQLite に保存します。
+3 分ごとに直近 3 分の顔検出、顔の bounding box 面積、深度の時系列を評価します。品質条件を満たす場合は Jev へ送り、寝返りあり / なし / 判定不能を記録します。
 
 - ファームウェア: ルートの ESP-IDF プロジェクト。
-- エッジアプリ: `edge/`、Rust 1.99.1 / edition 2024。
+- エッジアプリ: `edge/`、Rust 1.99.x / edition 2024。
 - 対象 OS: macOS 27.x、Debian 13.7。
 - 保存: 既定で 6 時間、全ベッド合計 100MB。容量制限を優先します。
 - 管理画面: HTTPS とデバイス固有の管理者認証。
-- ST7735（128×160px）に深度マップを各ゾーン 16×16px、64 階調で表示します。下部に文字を 2 行表示します。
+- ST7735 (128×160px) に深度マップを各ゾーン 16×16px、64 階調で表示します。下部に文字を 2 行表示します。
+
+## 注意
+
+本プロジェクトの各種資料に「商品」という単語が出てきますが、仮に商品化した場合の想定であり、現行の実装は開発用です。
 
 ## 構成
 
@@ -26,11 +30,11 @@ Freenove ESP32-S3 WROOM CAM と VL53L5CX から、顔検知と 8×8 深度を毎
 用意するもの:
 
 - Freenove ESP32-S3 WROOM CAM、VL53L5CX を搭載した Conta 基板、配線、データ通信対応の USB ケーブル。
-- 深度マップ表示用の ST7735 搭載 TFT（1.8-inch、128×160px、18bit、8 ピン SPI）と BL 用の 330Ω 抵抗。
+- 深度マップ表示用の ST7735 搭載 TFT (1.8-inch、128×160px、18bit、8 ピン SPI) と BL 用の 330Ω 抵抗。
 - macOS 27.x または Debian 13.7 のコンピュータ。
-- マイコンとエッジが相互通信できる LAN と、2.4GHz の WPA2 対応 Wi-Fi。ゲスト Wi-Fi などの端末間通信制限を解除する。
-- SDK・依存ライブラリの取得、マイコンの時刻同期（`pool.ntp.org`）、Jev API に接続できるネットワーク。
-- Jev による判定も試す場合は Jev API key。スクリプト内で非表示入力できる。キーなしでも観測の送信・保存は確認できる。
+- マイコンとエッジコンピュータが相互通信できる LAN と、2.4GHz の WPA2 対応 Wi-Fi。ゲスト Wi-Fi などの端末間通信制限を解除する。
+- SDK・依存ライブラリの取得、マイコンの時刻同期 (`pool.ntp.org`) 、Jev API に接続できるネットワーク。
+- Jev による判定も試す場合は Jev API key。スクリプト内で非表示入力できる。キーなしでも観測の送信・保存はできる。
 
 macOS では Command Line Tools と [Homebrew](https://brew.sh/) を導入し、次を実行します。
 `xcode-select --install` で表示されるインストール画面の完了を待ってから先へ進んでください。
@@ -44,14 +48,14 @@ brew install --cask eim-gui
 ```
 
 Debian では次のパッケージを導入します。
-ESP-IDF Installation Manager（EIM）は [Espressif の公式配布ページ](https://dl.espressif.com/dl/eim/) から使用環境に合う Linux 版を導入してください。
+ESP-IDF Installation Manager (EIM) は [Espressif の公式配布ページ](https://dl.espressif.com/dl/eim/) から使用環境に合う Linux 版を導入してください。
 
 ```sh
 sudo apt update
 sudo apt install git curl python3 python3-venv python3-pip openssl build-essential cmake ninja-build pkg-config ca-certificates libudev-dev libusb-1.0-0
 ```
 
-EIM を開き、ESP-IDF **6.0.3** と ESP32-S3 用ツールをインストールします。
+EIM を開き ESP-IDF **6.0.3** と ESP32-S3 用ツールをインストールします。
 別のバージョンを選ばないでください。ESP-DL と顔検知モデルはプロジェクトのビルド時に取得します。
 
 Rust は [公式の rustup インストーラ](https://rust-lang.org/tools/install/) で導入します。
@@ -72,14 +76,14 @@ git clone https://github.com/tkumata/prone-guard.git
 cd prone-guard
 ```
 
-**以降のコマンドは、特記がなければ全てこのルート（`README.md` があるディレクトリ）で実行します。**
+**以降のコマンドは、特記がなければ全てこのルート (`README.md` があるディレクトリ) で実行します。**
 新しいターミナルを使う場合も、このルートへ移動してください。
 
-**ESP-IDF の環境有効化は `setup.py` が行います。手動で `source export.sh` や activate を実行する必要はありません。**
+**ESP-IDF の環境有効化は `setup.py` が行います。手動で `source export.sh` や `activate.sh` を実行する必要はありません。**
 スクリプトは次の順で SDK を決め、必ずその SDK の `export.sh` を読み込みます。
 
 1. 環境変数 `IDF_PATH` がある場合は、その SDK を使う。
-2. EIM の標準配置 `~/.espressif/tools/activate_idf_v6.0.3.sh` がある場合は、そこから SDK・ツールの配置情報を取得する。
+2. EIM の標準配置 `$HOME/.espressif/tools/activate_idf_v6.0.3.sh` がある場合は、そこから SDK・ツールの配置情報を取得する。
 3. どちらもない場合は、`export.sh` が置かれている SDK ディレクトリを対話入力してもらう。
 
 その環境の Python でスクリプトを続行するため、ビルドと USB 初期設定にも同じ SDK 環境が引き継がれます。
@@ -94,19 +98,17 @@ openssl version
 
 #### VS Code を使用する場合
 
-VS Code に ESP-IDF 拡張（`espressif.esp-idf-extension`）と rust-analyzer（`rust-lang.rust-analyzer`）を導入し、リポジトリのルートフォルダを開きます。
+VS Code に ESP-IDF 拡張 (`espressif.esp-idf-extension`) と rust-analyzer (`rust-lang.rust-analyzer`) を導入し、リポジトリのルートフォルダを開きます。
 コマンドパレットの `Preferences: Open Workspace Settings (JSON)` から、`.vscode/settings.json` に次を設定してください。
 既に設定がある場合は、既存の項目を残して追加します。
 
 ```json
 {
   "rust-analyzer.linkedProjects": ["./edge/Cargo.toml"],
-  "rust-analyzer.server.extraEnv": {
-    "RUSTUP_TOOLCHAIN": "1.99.1"
-  },
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
   },
+  "idf.currentSetup": "/path/to/.espressif/v6.0.3/esp-idf",
   "idf.flashType": "UART",
   "idf.extensionActivationMode": "detect"
 }
@@ -121,7 +123,6 @@ ESP-IDF 拡張が `cmake was not found` と表示する場合は、[VS Code の�
 
 拡張が選択した環境を `idf.currentSetup` に保存します。SDK の実体パスを手入力する必要はありません。
 個人のパスやポートを共有しないため、`.vscode/settings.json` は Git の追跡対象から除外しています。
-設定は各環境で管理し、`git add -f` で追跡対象に戻さないでください。
 
 ### 2. 配線して USB 接続する
 
@@ -135,7 +136,7 @@ ESP-IDF 拡張が `cmake was not found` と表示する場合は、[VS Code の�
 | GND       | GND      |
 | 3.3V      | 3V3      |
 
-Conta は Switch Science の VL53L5CX 搭載品（商品番号 10281）を対象とします。
+Conta は Switch Science の VL53L5CX 搭載品 (商品番号 10281) を対象とします。
 IO4 は Conta 側の INT 端子名であり、Freenove の GPIO4 ではありません。現行コードは I²C ポーリングで取得するため、INT 配線は省略できます。
 カメラは GPIO4 / GPIO5 の I2C0、Conta は GPIO14 / GPIO21 の I2C1 を使用します。
 既存のビルド設定を再利用する場合は、[SETUP の I²C 設定](docs/current/SETUP.md#21-深度センサー) も確認してください。
@@ -181,7 +182,7 @@ Conta の測距時には約 100mA が必要です。電源に余裕を持たせ�
 ```sh
 python3 -m serial.tools.list_ports -v
 # 表示された実際のポートへ置き換える。Debian の例は /dev/ttyACM0。
-esptool --chip esp32s3 --port /dev/cu.usbmodem1234561 read-mac
+esptool --chip esp32s3 --port /dev/cu.usbmodem13201 read-mac
 ```
 
 表示された Wi-Fi MAC アドレスをマイコンの DHCP 予約に使用します。
@@ -258,13 +259,18 @@ sudo update-ca-certificates
 別のターミナルで HTTPS 受付を確認する場合は、同じリポジトリルートから次を実行します。IP は設定したエッジの IP へ置き換えます。
 
 ```sh
+# IP アドレスはエッジコンピュータの IP アドレスに置き換えてください
 curl --fail --cacert edge/local/ca.pem https://192.168.1.50:8443/health
 ```
 
 `"receiver":"ready"` はエッジの受付と保存領域が使用可能な状態です。
 Jev の判定結果は、エッジを起動したターミナルの標準エラーに、3 分周期で `posture_result` として出ます。
+`sensor-rollover-v3` の `status` は `rollover_detected`、`no_rollover`、`unjudgeable` のいずれかです。
 十分な観測が揃った周期で API を呼び出します。キーがない場合は、十分な観測があっても `jev_not_configured` を記録します。
-セットアップの接続確認には、Jev の実 API の成功や姿勢の識別精度の評価は含みません。
+Jev の実 API と寝返りの検出精度は、セットアップの接続確認とは別に検証します。
+各 `posture_result` の `quality` は観測不足の原因別件数を、`depth_motion_candidates` は寝返りを確定しない動作候補を示します。
+実測の検知率と判定不能率は `python3 tools/evaluate_rollover.py labels.csv edge.log.jsonl` で評価できます。
+正解CSVの形式は [寝返り評価手順](docs/plans/completed/2026-11-09-rollover-observation.md) を参照してください。
 
 通常の再起動では、マイコンへ給電し、エッジのリポジトリルートで次を実行します。
 再ビルド・eFuse 書込み・USB 初期設定は不要です。Jev を使う場合は、そのターミナルにも `JEV_API_KEY` を設定してください。
@@ -298,10 +304,10 @@ RGB666 の 64 階調を使い、各画素の明るさで距離を表します。
 | 見え方 | センサーからの距離の目安 |
 | --- | --- |
 | 白 | 0m |
-| 明るい灰色 | 1m（1000mm） |
-| 中間の灰色 | 2m（2000mm） |
-| 暗い灰色 | 3m（3000mm） |
-| 黒 | 4m（4000mm） |
+| 明るい灰色 | 1m (1000mm) |
+| 中間の灰色 | 2m (2000mm) |
+| 暗い灰色 | 3m (3000mm) |
+| 黒 | 4m (4000mm) |
 | 黒地に赤い `×` | 測距値が無効なゾーン |
 
 表示範囲は 0〜4m に固定し、フレームごとの自動正規化は行いません。
@@ -312,8 +318,8 @@ RGB666 の 64 階調を使い、各画素の明るさで距離を表します。
 下部 32px には、文字を 2 行表示します。
 1 行目は 6×16px の文字でマップ全体の状態と顔検知結果、
 2 行目は 8×16px の文字で凡例 `0-4m NEAR=WHITE` を表示します。
-顔検知時は `DEPTH / FACE ■ 12` と表示し、`■` は緑、面積は白です。
-面積は 320×240 の座標系における顔矩形の面積を整数の px² で表示します（最大 76800）。
+顔検知時は `DEPTH / FACE ■ 12439` と表示し、`■` は緑、面積は白です。
+面積は 320×240 の座標系における顔矩形の面積を整数の px² で表示します (最大 76800) 。
 未検知・カメラ未取得・取得失敗時は `DEPTH / FACE x` と表示し、`x` は赤です。
 `NO DATA`・`NO VALID` では、画面内に収めるため `/` 前後の空白を省きます。
 
@@ -351,7 +357,7 @@ CA・秘密鍵・登録状態を保持する `registrations.sqlite` は削除し
 
 セットアップのビルドを終えたリポジトリルートで、開発用のテストを個別実行する場合のコマンドです。
 このテスト用ターミナルは EIM の 6.0.3 の「Open IDF Terminal」を使用します。セットアップ本体では、この環境有効化は自動で行われます。
-UI テストには Node.js が必要です（macOS は `brew install node`、Debian は `sudo apt install nodejs`）。
+UI テストには Node.js が必要です (macOS は `brew install node`、Debian は `sudo apt install nodejs`) 。
 HTTPS テストは、ビルドしたエッジの実行ファイルを使用します。
 
 ```sh
@@ -359,9 +365,9 @@ IDF_BUILD_DIR=build/setup ./tests/run.sh
 node tests/test_ui.cjs
 python3 -m unittest discover -s tests -p 'test_provision.py'
 python3 -m unittest discover -s tests -p 'test_setup.py'
-cargo +1.99.1 test --manifest-path edge/Cargo.toml --locked
-cargo +1.99.1 clippy --manifest-path edge/Cargo.toml --locked --all-targets -- -D warnings
-cargo +1.99.1 build --manifest-path edge/Cargo.toml --locked
+cargo test --manifest-path edge/Cargo.toml --locked
+cargo clippy --manifest-path edge/Cargo.toml --locked --all-targets -- -D warnings
+cargo build --manifest-path edge/Cargo.toml --locked
 python3 -m unittest discover -s tests -p 'test_edge_https.py'
 ```
 
@@ -374,4 +380,4 @@ USB・配線・電源・センサーの方向・実 API の識別精度は実機
 - [要件](docs/current/REQUIREMENTS.md)
 - [仕様](docs/current/SPECIFICATIONS.md)
 - [設計](docs/current/DESIGN.md)
-- [商品向けの接続・登録設計](docs/current/CONNECTION.md)
+- [接続・登録設計](docs/current/CONNECTION.md)

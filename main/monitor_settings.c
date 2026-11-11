@@ -24,6 +24,9 @@ esp_err_t monitor_settings_load(monitor_settings_t *settings)
          size != offsetof(monitor_settings_t, face_model) && size != sizeof(loaded)) ||
         !monitor_settings_valid(&loaded))
         return ESP_ERR_INVALID_STATE;
+    // Old firmware cleared only the first byte of the stored key.
+    if (!loaded.device_key[0])
+        memset(loaded.device_key, 0, sizeof(loaded.device_key));
     *settings = loaded;
     return ESP_OK;
 }

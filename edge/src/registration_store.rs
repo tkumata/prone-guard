@@ -12,6 +12,10 @@ use std::{
     path::Path,
 };
 
+const LOOKUP_ACTIVE_REGISTRATION: &str = "SELECT data FROM registrations
+    WHERE json_extract(data, '$.revoked') = 0
+      AND json_extract(data, '$.active.token_sha256') = ?1";
+
 pub struct RegistrationStore {
     connection: Connection,
     _lock: std::fs::File,
@@ -64,6 +68,12 @@ impl RegistrationStore {
                 );
             }
         }
+        store.connection.execute_batch(
+            "CREATE INDEX IF NOT EXISTS registration_active_key
+             ON registrations(json_extract(data, '$.active.token_sha256'))
+             WHERE json_extract(data, '$.revoked') = 0
+               AND json_extract(data, '$.active.token_sha256') IS NOT NULL;",
+        )?;
         Ok(store)
     }
 
@@ -231,12 +241,15 @@ impl RegistrationStore {
         let Some(hash) = key_hash(authorization) else {
             return Ok(None);
         };
-        Ok(self
-            .records()?
-            .into_iter()
-            .filter(|(_, r)| !r.revoked)
-            .filter_map(|(_, r)| r.active)
-            .find(|r| r.matches_hash(&hash))
+        let mut lookup = self.connection.prepare_cached(LOOKUP_ACTIVE_REGISTRATION)?;
+        let data: Option<String> = lookup.query_row([&hash], |row| row.get(0)).optional()?;
+        let Some(data) = data else {
+            return Ok(None);
+        };
+        let record: Record = serde_json::from_str(&data)?;
+        Ok(record
+            .active
+            .filter(|r| !record.revoked && r.matches_hash(&hash))
             .map(|r| r.device()))
     }
 
@@ -274,6 +287,7 @@ fn key_hash(authorization: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::StatementStatus;
 
     #[test]
     fn pending_keys_require_check_and_device_commit_and_revocation_survives_restart() {
@@ -338,6 +352,84 @@ mod tests {
         let store = RegistrationStore::open(&path).unwrap();
         assert!(store.authenticate(&authorization).unwrap().is_none());
         assert_eq!(store.next_generation(&id).unwrap(), 2);
+        drop(store);
+        std::fs::remove_file(format!("{}.lock", path.display())).unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn authentication_does_not_read_revoked_history() {
+        let path = std::env::temp_dir().join(format!(
+            "prone-registration-history-{}.sqlite",
+            crate::security2::random_hex(8).unwrap()
+        ));
+        let mut store = RegistrationStore::open(&path).unwrap();
+        let authorization = format!("Bearer {}", "a".repeat(64));
+        let unknown = format!("Bearer {}", "b".repeat(64));
+        let id = "1".repeat(32);
+        let active = Registration {
+            device_id: id.clone(),
+            edge_id: "2".repeat(32),
+            transaction_id: "3".repeat(32),
+            generation: 1,
+            bed_id: "bed-01".into(),
+            token_sha256: key_hash(&authorization).unwrap(),
+            installation: serde_json::json!({}),
+        };
+        store
+            .save(
+                &id,
+                &Record {
+                    generation: 1,
+                    active: Some(active),
+                    ..Record::default()
+                },
+            )
+            .unwrap();
+        let history = serde_json::to_string(&Record {
+            generation: 1,
+            revoked: true,
+            ..Record::default()
+        })
+        .unwrap();
+        let transaction = store.connection.transaction().unwrap();
+        for id in 1..=256 {
+            transaction
+                .execute(
+                    "INSERT INTO registrations(device_id,data) VALUES(?1,?2)",
+                    params![format!("{id:032x}"), history],
+                )
+                .unwrap();
+        }
+        // Exercise reopening a DB written before the active key index existed.
+        transaction
+            .execute_batch("DROP INDEX IF EXISTS registration_active_key;")
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(store);
+
+        let store = RegistrationStore::open(&path).unwrap();
+        assert_eq!(
+            store.authenticate(&authorization).unwrap().unwrap().bed_id,
+            "bed-01"
+        );
+        // An unreadable record introduced after startup reveals a scan through revoked rows.
+        store
+            .connection
+            .execute(
+                "INSERT INTO registrations(device_id,data) VALUES(?1,?2)",
+                params!["4".repeat(32), r#"{"revoked":true}"#],
+            )
+            .unwrap();
+        assert!(store.authenticate(&unknown).unwrap().is_none());
+        assert!(store.authenticate(&authorization).unwrap().is_some());
+        let lookup = store
+            .connection
+            .prepare_cached(LOOKUP_ACTIVE_REGISTRATION)
+            .unwrap();
+        assert_eq!(lookup.get_status(StatementStatus::Run), 3);
+        assert_eq!(lookup.get_status(StatementStatus::FullscanStep), 0);
+        drop(lookup);
         drop(store);
         std::fs::remove_file(format!("{}.lock", path.display())).unwrap();
         std::fs::remove_file(path).unwrap();
