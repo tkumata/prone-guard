@@ -5,7 +5,7 @@ Freenove ESP32-S3 WROOM CAM と スイッチサイエンス Conta 基板 (VL53L5
 3 分ごとに直近 3 分の顔検出、顔の bounding box 面積、深度の時系列を評価します。品質条件を満たす場合は Jev へ送り、寝返りあり / なし / 判定不能を記録します。
 
 - ファームウェア: ルートの ESP-IDF プロジェクト。
-- エッジアプリ: `edge/`、Rust 1.99.x / edition 2024。
+- エッジアプリ: `edge/`、Rust 1.100.x / edition 2024。
 - 対象 OS: macOS 27.x、Debian 13.7。
 - 保存: 既定で 6 時間、全ベッド合計 100MB。容量制限を優先します。
 - 管理画面: HTTPS とデバイス固有の管理者認証。
@@ -55,7 +55,7 @@ sudo apt update
 sudo apt install git curl python3 python3-venv python3-pip openssl build-essential cmake ninja-build pkg-config ca-certificates libudev-dev libusb-1.0-0
 ```
 
-EIM を開き ESP-IDF **6.0.3** と ESP32-S3 用ツールをインストールします。
+EIM を開き ESP-IDF **6.1.1** と ESP32-S3 用ツールをインストールします。
 別のバージョンを選ばないでください。ESP-DL と顔検知モデルはプロジェクトのビルド時に取得します。
 
 Rust は [公式の rustup インストーラ](https://rust-lang.org/tools/install/) で導入します。
@@ -63,8 +63,8 @@ Rust は [公式の rustup インストーラ](https://rust-lang.org/tools/insta
 
 ```sh
 source "$HOME/.cargo/env"
-rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
-export RUSTUP_TOOLCHAIN=1.99.1
+rustup toolchain install 1.100.0 --profile minimal --component rustfmt --component clippy
+export RUSTUP_TOOLCHAIN=1.100.0
 rustc --version
 ```
 
@@ -83,11 +83,11 @@ cd prone-guard
 スクリプトは次の順で SDK を決め、必ずその SDK の `export.sh` を読み込みます。
 
 1. 環境変数 `IDF_PATH` がある場合は、その SDK を使う。
-2. EIM の標準配置 `$HOME/.espressif/tools/activate_idf_v6.0.3.sh` がある場合は、そこから SDK・ツールの配置情報を取得する。
+2. EIM の標準配置 `$HOME/.espressif/tools/activate_idf_v6.1.1.sh` がある場合は、そこから SDK・ツールの配置情報を取得する。
 3. どちらもない場合は、`export.sh` が置かれている SDK ディレクトリを対話入力してもらう。
 
 その環境の Python でスクリプトを続行するため、ビルドと USB 初期設定にも同じ SDK 環境が引き継がれます。
-`export.sh` の実行に失敗した場合や SDK の版が 6.0.3 と異なる場合は、実機への書込み前に停止します。
+`export.sh` の実行に失敗した場合や SDK の版が 6.1.1 と異なる場合は、実機への書込み前に停止します。
 
 macOS では証明書生成に Homebrew の OpenSSL を使うため、次を実行します。
 
@@ -108,14 +108,14 @@ VS Code に ESP-IDF 拡張 (`espressif.esp-idf-extension`) と rust-analyzer (`r
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
   },
-  "idf.currentSetup": "/path/to/.espressif/v6.0.3/esp-idf",
+  "idf.currentSetup": "/path/to/.espressif/v6.1.1/esp-idf",
   "idf.flashType": "UART",
   "idf.extensionActivationMode": "detect"
 }
 ```
 
-コマンドパレットで `ESP-IDF: Select Current ESP-IDF Version` を実行し、ESP-IDF **6.0.3** を選択します。
-バージョン名が `vx.x` と表示される場合は、EIM で 6.0.3 に登録されているパスを一覧で選択します。
+コマンドパレットで `ESP-IDF: Select Current ESP-IDF Version` を実行し、ESP-IDF **6.1.1** を選択します。
+バージョン名が `vx.x` と表示される場合は、EIM で 6.1.1 に登録されているパスを一覧で選択します。
 ビルドには `ESP-IDF: Build Your Project` を使います。
 ESP-IDF 拡張が `cmake was not found` と表示する場合は、[VS Code のビルド環境の確認](docs/current/SETUP.md#vs-code-のビルド環境の確認) を参照してください。
 第 2 節の配線・USB 接続後に、`ESP-IDF: Select Port to Use (COM, tty, usbserial)` でボードのポートを選択してください。
@@ -177,7 +177,7 @@ Conta の測距時には約 100mA が必要です。電源に余裕を持たせ�
 マイコンのファームウェアも DHCP を使うため、IP の入力だけではアドレスは固定されません。
 
 エッジの現在の IP は、macOS では「システム設定 → ネットワーク → 接続中のインターフェイス → 詳細 → TCP/IP」、Debian では `ip -4 addr` で確認できます。
-マイコンの MAC アドレスが不明な場合は、基板の表示や既存の記録を確認します。個別に USB で調べる場合は、EIM の 6.0.3 の「Open IDF Terminal」で次を実行できます。この診断用ターミナルの起動は `setup.py` の実行には不要です。
+マイコンの MAC アドレスが不明な場合は、基板の表示や既存の記録を確認します。個別に USB で調べる場合は、EIM の 6.1.1 の「Open IDF Terminal」で次を実行できます。この診断用ターミナルの起動は `setup.py` の実行には不要です。
 
 ```sh
 python3 -m serial.tools.list_ports -v
@@ -201,7 +201,7 @@ python3 tools/setup.py
 
 スクリプトは次の順に進みます。
 
-1. `export.sh` を読み込み、SDK の Python で続行する。Rust、ESP-IDF 6.0.3、OpenSSL、USB 用 Python モジュールを確認し、不足があれば実機へ書き込まず停止する。
+1. `export.sh` を読み込み、SDK の Python で続行する。Rust、ESP-IDF 6.1.1、OpenSSL、USB 用 Python モジュールを確認し、不足があれば実機へ書き込まず停止する。
 2. USB ポートを一覧表示し、接続した ESP32-S3 のポートを入力してもらう。ポートが分かる場合は `python3 tools/setup.py --port /dev/ttyACM0` のように指定できる。
 3. 初回は以下を対話入力し、生成内容を確認してから証明書・鍵・設定を `edge/local/` に作成する。既に設定があれば、鍵を生成し直さず再利用する。
 4. 設定と証明書の整合性、秘密ファイルの権限、このコンピュータの指定 IP と TCP 8443 番が使用可能かを検査する。
@@ -285,7 +285,7 @@ edge/target/debug/prone-guard-edge edge/local/config.json
 
 | 停止した箇所 | 対処 |
 | --- | --- |
-| ESP-IDF の確認 | SDK 6.0.3 とツールの導入を確認する。`IDF_PATH` が別の SDK を指している場合は修正または解除し、`setup.py` を再実行する |
+| ESP-IDF の確認 | SDK 6.1.1 とツールの導入を確認する。`IDF_PATH` が別の SDK を指している場合は修正または解除し、`setup.py` を再実行する |
 | USB の選択・書込み | ネイティブ USB 側、データ通信対応ケーブル、正しいポートを確認し、シリアルモニタを終了する |
 | Debian の USB 権限 | `sudo usermod -aG dialout "$USER"` を実行し、ログインし直して `setup.py` を再実行する |
 | eFuse の検査 | 既存の KEY0 の用途を確認する。別用途のキーを上書きしない。書込み失敗後にキーファイルを再生成しない |
@@ -356,7 +356,7 @@ CA・秘密鍵・登録状態を保持する `registrations.sqlite` は削除し
 ## 開発用の自動テスト
 
 セットアップのビルドを終えたリポジトリルートで、開発用のテストを個別実行する場合のコマンドです。
-このテスト用ターミナルは EIM の 6.0.3 の「Open IDF Terminal」を使用します。セットアップ本体では、この環境有効化は自動で行われます。
+このテスト用ターミナルは EIM の 6.1.1 の「Open IDF Terminal」を使用します。セットアップ本体では、この環境有効化は自動で行われます。
 UI テストには Node.js が必要です (macOS は `brew install node`、Debian は `sudo apt install nodejs`) 。
 HTTPS テストは、ビルドしたエッジの実行ファイルを使用します。
 
