@@ -97,7 +97,7 @@ USB の VID/PID、シリアル番号、自動検出結果だけでは機器を�
 USB フレームは最大 32KiB、復号後の設定は最大 16KiB に制限する。
 未認証時は必要なハンドシェイク以外の設定処理を実行しない。
 
-ESP-IDF 6.0.3 の標準 `protocomm_console` は UART 用で、行バッファが 256 bytes である。
+ESP-IDF 6.1.1 の標準 `protocomm_console` は UART 用で、行バッファが 256 bytes である。
 現在の USB Serial/JTAG にそのまま接続できるとは扱わない。
 既存 USB I/O と公開 `protocomm` API を接続する、長さ上限付きの transport を実装する。
 Security 2 のハンドシェイクと AES-GCM の nonce 管理は公式実装に任せる。
@@ -224,5 +224,5 @@ LAN 上の第三者、偽のエッジ、偽の USB 機器、盗聴、改ざん�
 
 - [ESP-IDF Protocol Communication](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/api-reference/provisioning/protocomm.html): Security 2 と transport の分離。
 - [ESP-IDF Security Overview](https://docs.espressif.com/projects/esp-idf/en/stable/esp32s3/security/security.html): 製造時の保護、通信・更新の保護。
-- [ESP-IDF 6.0.3 ESP-TLS](https://docs.espressif.com/projects/esp-idf/en/v6.0.3/esp32s3/api-reference/protocols/esp_tls.html): CA と接続先名の検証。
-- ESP-IDF 6.0.3 の API と console の動作は、SDK 内の `components/protocomm/` を参照する。
+- [ESP-IDF 6.1.1 ESP-TLS](https://docs.espressif.com/projects/esp-idf/en/v6.1.1/esp32s3/api-reference/protocols/esp_tls.html): CA と接続先名の検証。
+- ESP-IDF 6.1.1 の API と console の動作は、SDK 内の `components/protocomm/` を参照する。

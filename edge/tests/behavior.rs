@@ -145,12 +145,16 @@ fn quality_report_explains_skipped_observations() {
 #[test]
 fn temporal_features_do_not_invent_body_orientation() {
     let end = START + 180;
-    let window = measurement::prepare_window(rows(end), end).unwrap();
+    let mut window = measurement::prepare_window(rows(end), end).unwrap();
+    let mut status = [[255; 8]; 8];
+    status[0][0] = 5;
+    window.rows[1].depth.target_status = Some(status);
     let features = jev::temporal_features(&window);
     assert_eq!(features.len(), 180);
     assert_eq!(features[0]["valid_cells"], 64);
     assert_eq!(features[0]["median_distance_mm"], 1000);
     assert_eq!(features[0]["adjacent_gradient_mm"], 0);
+    assert_eq!(features[1].get("adjacent_gradient_mm"), Some(&Value::Null));
     assert!(features[0].get("torso_orientation").is_none());
 }
 
@@ -162,9 +166,9 @@ fn depth_motion_candidate_requires_multiple_valid_changed_cells() {
     for row in data.iter_mut().skip(80) {
         let m = &mut row.measurement;
         let mut distance = m.depth.distance.unwrap();
-        for y in 0..4 {
-            for x in 0..4 {
-                distance[y][x] += 400;
+        for row in &mut distance[..4] {
+            for cell in &mut row[..4] {
+                *cell += 400;
             }
         }
         m.depth.distance = Some(distance);

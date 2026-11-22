@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
         result=server.serve(router(app).into_make_service()) => {result?;}
         result=scheduler => {result??; anyhow::bail!("scheduler stopped");}
         result=maintenance => {result??; anyhow::bail!("maintenance stopped");}
-        result=certificate_maintenance => {result??; anyhow::bail!("certificate maintenance stopped");}
+        result=certificate_maintenance => {result??}
         result=tokio::signal::ctrl_c() => {result?;}
     }
     Ok(())
@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
 async fn renew_certificates(
     app: Arc<App>,
     tls: axum_server::tls_rustls::RustlsConfig,
-) -> Result<()> {
+) -> Result<!> {
     let mut ca_warning = false;
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;

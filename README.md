@@ -5,7 +5,7 @@ Freenove ESP32-S3 WROOM CAM と スイッチサイエンス Conta 基板 (VL53L5
 3 分ごとに直近 3 分の顔検出、顔の bounding box 面積、深度の時系列を評価します。品質条件を満たす場合は Jev へ送り、寝返りあり / なし / 判定不能を記録します。
 
 - ファームウェア: ルートの ESP-IDF プロジェクト。
-- エッジアプリ: `edge/`、Rust 1.100.x / edition 2024。
+- エッジアプリ: `edge/`、Rust 1.100.0 以上の安定版 / edition 2024。
 - 対象 OS: macOS 27.x、Debian 13.7。
 - 保存: 既定で 6 時間、全ベッド合計 100MB。容量制限を優先します。
 - 管理画面: HTTPS とデバイス固有の管理者認証。
@@ -63,10 +63,11 @@ Rust は [公式の rustup インストーラ](https://rust-lang.org/tools/insta
 
 ```sh
 source "$HOME/.cargo/env"
-rustup toolchain install 1.100.0 --profile minimal --component rustfmt --component clippy
-export RUSTUP_TOOLCHAIN=1.100.0
+rustup toolchain install stable --profile minimal --component rustfmt --component clippy
 rustc --version
 ```
+
+`rustc --version` で Rust 1.100.0 以上の安定版が選択されていることを確認します。
 
 リポジトリを取得し、ルートへ移動します。clone 済みなら `git clone` は不要です。
 SDK とリポジトリは、空白を含まないパスに配置してください。
@@ -80,14 +81,14 @@ cd prone-guard
 新しいターミナルを使う場合も、このルートへ移動してください。
 
 **ESP-IDF の環境有効化は `setup.py` が行います。手動で `source export.sh` や `activate.sh` を実行する必要はありません。**
-スクリプトは次の順で SDK を決め、必ずその SDK の `export.sh` を読み込みます。
+スクリプトは次の順で SDK を選び、環境を有効化します。
 
-1. 環境変数 `IDF_PATH` がある場合は、その SDK を使う。
-2. EIM の標準配置 `$HOME/.espressif/tools/activate_idf_v6.1.1.sh` がある場合は、そこから SDK・ツールの配置情報を取得する。
-3. どちらもない場合は、`export.sh` が置かれている SDK ディレクトリを対話入力してもらう。
+1. 環境変数 `IDF_PATH` がある場合は、その SDK の `export.sh` を読み込む。
+2. EIM の標準配置 `$HOME/.espressif/tools/activate_idf_v6.1.1.sh` がある場合は、EIM が出力する SDK・ツール・Python の環境を使う。
+3. どちらもない場合は SDK ディレクトリを対話入力してもらい、そこにある `export.sh` を読み込む。
 
 その環境の Python でスクリプトを続行するため、ビルドと USB 初期設定にも同じ SDK 環境が引き継がれます。
-`export.sh` の実行に失敗した場合や SDK の版が 6.1.1 と異なる場合は、実機への書込み前に停止します。
+環境の有効化に失敗した場合や SDK の版が 6.1.1 と異なる場合は、実機への書込み前に停止します。
 
 macOS では証明書生成に Homebrew の OpenSSL を使うため、次を実行します。
 
@@ -190,9 +191,9 @@ esptool --chip esp32s3 --port /dev/cu.usbmodem13201 read-mac
 
 ### 4. セットアップスクリプトを実行する
 
-**開発ツールを導入して USB 接続した後、`python3 tools/setup.py` を実行します。** スクリプトが `export.sh` による ESP-IDF 環境の有効化、設定生成、ビルド、確認付き eFuse 準備・flash、USB 初期設定、エッジ起動、接続確認を順に行います。
+**開発ツールを導入して USB 接続した後、`python3 tools/setup.py` を実行します。** スクリプトが ESP-IDF 環境の有効化、設定生成、ビルド、確認付き eFuse 準備・flash、USB 初期設定、エッジ起動、接続確認を順に行います。
 
-通常のターミナルで、リポジトリルートから実行します。ESP-IDF の `export.sh` はスクリプトが読み込みます。
+通常のターミナルで、リポジトリルートから実行します。
 **ビルド、flash、USB 初期設定、エッジの起動は、このスクリプトが実行します。別々にコマンドを実行する必要はありません。**
 
 ```sh
@@ -201,7 +202,7 @@ python3 tools/setup.py
 
 スクリプトは次の順に進みます。
 
-1. `export.sh` を読み込み、SDK の Python で続行する。Rust、ESP-IDF 6.1.1、OpenSSL、USB 用 Python モジュールを確認し、不足があれば実機へ書き込まず停止する。
+1. ESP-IDF 環境を有効化し、SDK の Python で続行する。Rust、ESP-IDF 6.1.1、OpenSSL、USB 用 Python モジュールを確認し、不足があれば実機へ書き込まず停止する。
 2. USB ポートを一覧表示し、接続した ESP32-S3 のポートを入力してもらう。ポートが分かる場合は `python3 tools/setup.py --port /dev/ttyACM0` のように指定できる。
 3. 初回は以下を対話入力し、生成内容を確認してから証明書・鍵・設定を `edge/local/` に作成する。既に設定があれば、鍵を生成し直さず再利用する。
 4. 設定と証明書の整合性、秘密ファイルの権限、このコンピュータの指定 IP と TCP 8443 番が使用可能かを検査する。

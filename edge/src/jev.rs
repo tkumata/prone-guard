@@ -90,7 +90,7 @@ pub fn temporal_features(window: &Window) -> Vec<Value> {
             "median_distance_mm":if values.is_empty(){None}else{Some(values[values.len()/2])},
             "valid_centroid_x_milli":if n==0{None}else{Some(sum_x*1000/n)},
             "valid_centroid_y_milli":if n==0{None}else{Some(sum_y*1000/n)},
-            "adjacent_gradient_mm":if edges==0{None}else{Some(gradient/edges)},
+            "adjacent_gradient_mm":gradient.checked_div(edges),
             "face_detected":m.camera.face_detected,
             "face_box":m.camera.face_box
         })
