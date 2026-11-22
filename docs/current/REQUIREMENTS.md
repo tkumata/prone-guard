@@ -17,7 +17,7 @@
 - Switch Science Conta VL53L5CX、8×8、1 セル 1 対象。
 - ST7735 搭載の 1.8-inch、128×160px、18bit TFT。縦向きの SPI 接続とする。
 - Wi-Fi STA、HTTPS、JSONL、NTP。
-- Rust 1.99.1 / edition 2024、macOS 27.x、Debian 13.7。
+- Rust 1.100.0 以上の安定版 / edition 2024、macOS 27.x、Debian 13.7。
 - 同じリポジトリの `edge/` に Rust アプリを配置する。
 - 医療用途認証、通知アプリ、画像送信、モデル学習は対象外。
 

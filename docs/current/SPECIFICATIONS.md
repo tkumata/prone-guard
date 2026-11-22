@@ -340,7 +340,7 @@ HMAC キーは事前設定済みの eFuse KEY0 を既定として使用する。
 ### SPI と表示障害
 
 - MUST: SPI2_HOST、mode 0、8MHz の書込み専用接続とする。
-- MUST: ESP-IDF 6.0.3 の標準 SPI/GPIO API を使用する。
+- MUST: ESP-IDF 6.1.1 の標準 SPI/GPIO API を使用する。
 - MUST: 16 行単位で RGB666 を転送する。
 - MUST: 論理列 0〜127 を、パネルの RAM 列 2〜129 へ対応させる。
 - MUST: 行オフセットは 0 とする。

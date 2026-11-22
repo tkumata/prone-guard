@@ -236,7 +236,7 @@ def activate_idf(root):
         return
     environment = os.environ.copy()
     sdk = environment.get("IDF_PATH")
-    activation = Path.home() / ".espressif/tools/activate_idf_v6.0.3.sh"
+    activation = Path.home() / ".espressif/tools/activate_idf_v6.1.1.sh"
     if sdk:
         location = Path(sdk).expanduser().resolve()
     elif activation.is_file():
@@ -244,13 +244,19 @@ def activate_idf(root):
                        capture=True, timeout=30).stdout
         values = dict(line.split("=", 1)
                       for line in exported.splitlines() if "=" in line)
-        environment.update({name: values[name] for name in (
-            "IDF_PATH", "IDF_TOOLS_PATH", "IDF_PYTHON_ENV_PATH",
-        )})
-        location = Path(environment["IDF_PATH"])
+        for name in ("IDF_PATH", "IDF_TOOLS_PATH", "IDF_PYTHON_ENV_PATH", "PATH"):
+            if not values.get(name):
+                raise RuntimeError(f"EIM の環境情報に {name} がありません。")
+        inherited_path = environment.get("PATH") or os.defpath
+        environment.update(values)
+        environment["PATH"] = os.pathsep.join((values["PATH"], inherited_path))
+        environment["_PRONE_GUARD_IDF_ACTIVE"] = values["IDF_PATH"]
+        python = str(Path(values["IDF_PYTHON_ENV_PATH"]) / "bin/python3")
+        print("EIM の ESP-IDF 環境でセットアップを続行します。", flush=True)
+        os.execvpe(python, [python, str(root / "tools/setup.py"), *sys.argv[1:]], environment)
     else:
         location = Path(input(
-            "ESP-IDF 6.0.3 のディレクトリ（export.sh がある場所）: "
+            "ESP-IDF 6.1.1 のディレクトリ（export.sh がある場所）: "
         ).strip()).expanduser().resolve()
     if not (location / "export.sh").is_file():
         raise ValueError(f"{location} に export.sh が見つかりません。")
@@ -287,22 +293,23 @@ def preflight(root, registration):
         raise RuntimeError("cargo が見つかりません。Rust と rustup を導入してください。")
     version = run(root, ["rustc", "--version"],
                   capture=True, timeout=30).stdout
-    if not version.startswith("rustc 1.99.1 "):
-        raise RuntimeError("Rust 1.99.1 を選択してください。rustup で導入した場合は "
-                           "RUSTUP_TOOLCHAIN=1.99.1 を設定して再実行できます。")
+    release = re.match(r"rustc ([0-9]+)\.([0-9]+)\.([0-9]+)(?:\s|$)", version)
+    if release is None or tuple(map(int, release.groups())) < (1, 100, 0):
+        raise RuntimeError("Rust 1.100.0 以上の安定版が必要です。rustup を使う場合は "
+                           "rustup update stable で更新し、安定版を選択してください。")
     run(root, ["cargo", "--version"], capture=True, timeout=30)
     if registration:
         return None
     idf_path = os.environ.get("IDF_PATH")
     if not idf_path:
         raise RuntimeError(
-            "export.sh の実行後に IDF_PATH が設定されていません。SDK の導入状態を確認してください。"
+            "ESP-IDF 環境の有効化後に IDF_PATH が設定されていません。SDK の導入状態を確認してください。"
         )
     idf = [sys.executable, str(Path(idf_path) / "tools/idf.py")]
     version = run(root, [*idf, "--version"],
                   capture=True, timeout=30).stdout.strip()
-    if not re.fullmatch(r"ESP-IDF v6\.0\.3(?:-.*)?", version):
-        raise RuntimeError("ESP-IDF 6.0.3 の環境が必要です。")
+    if not re.fullmatch(r"ESP-IDF v6\.1\.1(?:-.*)?", version):
+        raise RuntimeError("ESP-IDF 6.1.1 の環境が必要です。")
     run(root, [sys.executable, "-c", "import serial, esptool, espefuse"],
         capture=True, timeout=30)
     if shutil.which("openssl") is None:

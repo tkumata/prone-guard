@@ -338,10 +338,11 @@ class Setup(unittest.TestCase):
                f'export PATH={shlex.quote(str(binary))}:"$PATH"\nexport EXPORT_RAN=yes\n'))
         home = self.root / "home"
         if eim:
-            activation = home / ".espressif/tools/activate_idf_v6.0.3.sh"
+            activation = home / ".espressif/tools/activate_idf_v6.1.1.sh"
             activation.parent.mkdir(parents=True)
             (activation.parent / "esp-rom-elfs").mkdir()
-            values = [f"IDF_PATH={sdk}", f"IDF_TOOLS_PATH={activation.parent}", f"IDF_PYTHON_ENV_PATH={sdk}"]
+            values = [f"IDF_PATH={sdk}", f"IDF_TOOLS_PATH={activation.parent}",
+                      f"IDF_PYTHON_ENV_PATH={sdk}", f"PATH={activation.parent / 'compiler/bin'}"]
             activation.write_text('[ "$1" = -e ] || exit 1\n'
                                   + "printf '%s\\n' " + " ".join(shlex.quote(v) for v in values) + "\n"
                                   + f'printf "eim\\n" >> {shlex.quote(str(trace))}\n')
@@ -349,6 +350,7 @@ class Setup(unittest.TestCase):
         probe.write_text('''import json, os, sys
 print(json.dumps({"sdk": os.environ["IDF_PATH"], "loaded": os.environ.get("EXPORT_RAN"),
                   "marker": os.environ.get("_PRONE_GUARD_IDF_ACTIVE"),
+                  "tools": os.environ.get("IDF_TOOLS_PATH"), "path": os.environ["PATH"],
                   "interpreter": os.environ.get("ACTIVATED_PYTHON"), "arguments": sys.argv[1:]}))
 ''')
         driver = '''import importlib.util, sys
@@ -372,16 +374,19 @@ setup.activate_idf(Path(root))
                                 cwd=self.foreign, env=environment, timeout=10)
         return result, sdk, trace
 
-    def test_eim_bootstrap_sources_export_and_uses_activated_python_without_manual_source(self):
-        result, sdk, trace = self.bootstrap(eim=True)
+    def test_eim_bootstrap_uses_exported_environment_and_sdk_python(self):
+        result, sdk, trace = self.bootstrap(eim=True, fail=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         data = json.loads(result.stdout.splitlines()[-1])
         self.assertEqual(Path(data["sdk"]).resolve(), sdk.resolve())
         self.assertEqual(Path(data["marker"]).resolve(), sdk.resolve())
-        self.assertEqual(data["loaded"], "yes")
+        tools = self.root / "home/.espressif/tools"
+        self.assertEqual(data["tools"], str(tools))
+        self.assertEqual(data["path"], os.pathsep.join((str(tools / "compiler/bin"),
+                                                       os.environ.get("PATH") or os.defpath)))
         self.assertEqual(data["interpreter"], "yes")
         self.assertEqual(data["arguments"], ["--port", "/dev/test-usb"])
-        self.assertEqual(trace.read_text().splitlines(), ["eim", "export"])
+        self.assertEqual(trace.read_text().splitlines(), ["eim"])
 
     def test_explicit_sdk_also_sources_export(self):
         result, sdk, trace = self.bootstrap(explicit=True)
@@ -408,9 +413,28 @@ setup.activate_idf(Path(root))
         execute.assert_not_called()
         with patch.object(self.setup, "activate_idf") as activate, \
                 patch.object(self.setup.shutil, "which", return_value="/cargo"), \
-                patch.object(self.setup, "run", return_value=SimpleNamespace(stdout="rustc 1.99.1 (test)")):
+                patch.object(self.setup, "run", return_value=SimpleNamespace(stdout="rustc 1.100.0 (test)")):
             self.assertIsNone(self.setup.preflight(self.root, True))
         activate.assert_not_called()
+
+    def test_rust_preflight_requires_a_stable_release_at_or_above_the_minimum(self):
+        cases = (
+            ("1.99.1", False),
+            ("1.100.0", True),
+            ("1.100.1", True),
+            ("1.101.0", True),
+            ("1.101.0-nightly", False),
+            ("1.101.0-beta.1", False),
+        )
+        for version, accepted in cases:
+            with self.subTest(version=version), \
+                    patch.object(self.setup.shutil, "which", return_value="/cargo"), \
+                    patch.object(self.setup, "run", return_value=SimpleNamespace(stdout=f"rustc {version} (test)")):
+                if accepted:
+                    self.assertIsNone(self.setup.preflight(self.root, True))
+                else:
+                    with self.assertRaisesRegex(RuntimeError, r"Rust 1\.100\.0"):
+                        self.setup.preflight(self.root, True)
 
     def test_generated_build_settings_must_keep_usb_and_hmac_contract(self):
         build = self.root / "build/setup"

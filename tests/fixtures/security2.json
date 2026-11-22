@@ -1,5 +1,5 @@
 {
-  "source": "ESP-IDF 6.0.3 esp_local_ctrl/scripts/security/srp6a.py; transmitted-A proof format from components/protocomm/src/crypto/srp6a/esp_srp.c; public test credentials only",
+  "source": "ESP-IDF 6.1.1 esp_local_ctrl/scripts/security/srp6a.py; transmitted-A proof format from components/protocomm/src/crypto/srp6a/esp_srp.c; public test credentials only",
   "cases": [
     {
       "username": "11111111111111111111111111111111",

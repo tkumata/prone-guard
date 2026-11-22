@@ -12,7 +12,7 @@
 
 通常の構築は [README の初期設定から動作確認まで](../../README.md#初期設定から動作確認まで) に従う。
 開発ツールを導入して USB 接続した後、通常のターミナルでリポジトリルートから `python3 tools/setup.py` を実行する。
-`export.sh` による環境有効化、設定生成、専用ビルド先でのビルド、確認付き HMAC 準備・flash、USB 初期設定、エッジ起動、HTTPS 接続確認をスクリプトが行う。
+ESP-IDF 環境の有効化、設定生成、専用ビルド先でのビルド、確認付き HMAC 準備・flash、USB 初期設定、エッジ起動、HTTPS 接続確認をスクリプトが行う。
 エッジと実機の Wi-Fi・時刻・センサー・送信の成功を確認するまでは完了表示を出さない。
 起動したエッジは Ctrl-C まで動作し、失敗・中断時はスクリプトが起動したプロセスだけを停止する。
 以下の第 3〜6 節は処理内容と個別診断用コマンドの説明である。通常の構築では、スクリプト実行後に各コマンドを重ねて実行する必要はない。
@@ -79,8 +79,8 @@ CA 秘密鍵、デバイス秘密鍵、`device.json`、HMAC キーは転送し�
 
 ## 1. 開発環境
 
-- ファームウェア: ESP-IDF 6.0.3、ESP-DL 3.3.14、human_face_detect 0.5.1。
-- エッジ: Rust 1.99.1、edition 2024。
+- ファームウェア: ESP-IDF 6.1.1、ESP-DL 3.3.14、human_face_detect 0.5.1。
+- エッジ: Rust 1.100.0 以上の安定版、edition 2024。
 - OS: macOS 27.x または Debian 13.7。
 - USB 設定: ESP-IDF の Python と pyserial。
 - 証明書と設定の生成: Python 3 と OpenSSL。
@@ -89,16 +89,17 @@ OpenSSL が必要なのは第 3 節の証明書生成手順である。
 第 8 節では Python 3 と Rust でエッジを構築し、証明書は Rust アプリが生成する。OpenSSL と ESP-IDF は不要である。
 
 通常のセットアップでは、`setup.py` が ESP-IDF の環境を有効化するため、手動の source は不要である。
-`IDF_PATH` があればその SDK を使用する。未設定なら EIM の標準配置 `~/.espressif/tools/activate_idf_v6.0.3.sh` から SDK・ツールの配置を取得する。
-いずれもない場合は、`export.sh` がある SDK ディレクトリを対話入力する。
-スクリプトは SDK の `export.sh` を読み込み、そこで選択された Python で自分自身を再起動する。
+`IDF_PATH` があれば、その SDK の `export.sh` を読み込む。
+未設定で EIM の標準配置 `~/.espressif/tools/activate_idf_v6.1.1.sh` があれば、EIM が出力する SDK・ツール・Python の環境を使う。
+いずれもない場合は、`export.sh` がある SDK ディレクトリを対話入力し、その `export.sh` を読み込む。
+スクリプトは有効化した環境の Python で自分自身を再起動する。
 ビルド・eFuse・USB 設定はこの環境を引き継ぐ。読み込み失敗時や版の不一致時は実機へ書き込まず停止する。
 
 以下の手動の環境有効化は、本書の個別診断や自動テストを直接実行するターミナル用である。`setup.py` を実行する前提手順ではない。
 EIM の標準配置では次を使う。
 
 ```sh
-source "$HOME/.espressif/tools/activate_idf_v6.0.3.sh"
+source "$HOME/.espressif/tools/activate_idf_v6.1.1.sh"
 ```
 
 手動導入の場合は、次の `/path/to/esp-idf` を SDK の配置先へ置き換える。
@@ -114,10 +115,10 @@ source "$IDF_PATH/export.sh"
 ```sh
 # 実行場所: リポジトリルート。EIM と手動インストールの両方で確認する。
 idf.py --version
-# ESP-IDF v6.0.3 であることを確認する。
+# ESP-IDF v6.1.1 であることを確認する。
 ```
 
-セットアップスクリプトは Rust 1.99.1 を要求する。rustup を使う場合は `RUSTUP_TOOLCHAIN=1.99.1` を指定する。
+セットアップスクリプトは Rust 1.100.0 以上の安定版を要求する。rustup を使う場合は `rustup update stable` で更新し、安定版を選択する。
 エッジの依存関係は `edge/Cargo.lock` に固定する。
 Debian のビルドには `build-essential`、`cmake`、`pkg-config`、`ca-certificates`、`libudev-dev` を用意する。
 `libudev-dev` は Rust の `serialport` が Linux の USB ポートを列挙するために必要である。
@@ -130,7 +131,7 @@ C/C++ のコンパイル情報は、ビルドで生成する `compile_commands.j
 
 ターミナルで `cmake --version` が通るのに ESP-IDF 拡張で `cmake was not found` が出る場合は、拡張の環境を確認する。
 EIM の登録パスと SDK の実体パスが異なる構成では、`idf.currentSetup` に実体パスを手入力すると、拡張が起動時に環境を復元できない場合がある。
-`ESP-IDF: Select Current ESP-IDF Version` で EIM の 6.0.3 の登録項目を選び直し、`ESP-IDF: Build Your Project` を実行する。
+`ESP-IDF: Select Current ESP-IDF Version` で EIM の 6.1.1 の登録項目を選び直し、`ESP-IDF: Build Your Project` を実行する。
 選択後の SDK とツールのパスは `ESP-IDF: Doctor Command` で確認できる。
 SQLite と TLS ライブラリは Cargo の依存としてビルドする。
 
@@ -178,7 +179,7 @@ GPIO14 / GPIO21 / GPIO47 は同ピン配置でカメラ、PSRAM（GPIO35〜37）
 Conta には SDA / SCL それぞれに 10kΩ のプルアップがある。
 10kΩ だけで 400kHz の動作を保証しない。
 配線容量に応じて 3.3V への外付け抵抗を選び、立ち上がりを実測する。
-抵抗の選定は [ESP-IDF I²C ガイド](https://docs.espressif.com/projects/esp-idf/en/v6.0.3/esp32s3/api-reference/peripherals/i2c.html) に従う。
+抵抗の選定は [ESP-IDF I²C ガイド](https://docs.espressif.com/projects/esp-idf/en/v6.1.1/esp32s3/api-reference/peripherals/i2c.html) に従う。
 内部プルアップだけに依存せず、5V へプルアップしない。
 
 ### 2.2. TFT ST7735
@@ -476,7 +477,7 @@ python3 tools/setup.py --registration
 
 スクリプトは作成前に確認し、`config.json` だけを権限 `0600`、ディレクトリを `0700` で配置する。
 既存の `edge/local/` は変更しない。生成済みの登録管理設定と DB は検証して再利用する。
-その後に Rust 1.99.1 でエッジをビルド・起動し、登録 DB の CA・名前を使って HTTPS の準備完了を確認する。
+その後にエッジをビルド・起動し、登録 DB の CA・名前を使って HTTPS の準備完了を確認する。
 スクリプトは Ctrl-C までエッジを動作させる。失敗・中断時は、起動したエッジを停止して設定・DB を保持する。
 IP アドレス、Wi-Fi、ベッド ID、機器別キーは、この設定作成では入力しない。
 機器登録を行う商品用の画面と USB 統合が未完了のため、設定の作成やエッジの起動を「接続完了」とは扱わない。
