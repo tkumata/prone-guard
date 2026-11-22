@@ -58,6 +58,21 @@ int main(int argc, char **argv)
            1);
     cJSON_Delete(json);
     cJSON_free(encoded);
+    sample.face_confidence = 0.85;
+    sample.face_box[0] = 10;
+    sample.face_box[1] = 20;
+    sample.face_box[2] = 50;
+    sample.face_box[3] = 50;
+    encoded = telemetry_encode(&sample, "sample-boot", "bed-01");
+    assert(encoded);
+    json = cJSON_Parse(encoded);
+    assert(json);
+    cJSON *camera = cJSON_GetObjectItem(json, "camera");
+    assert(cJSON_GetObjectItem(camera, "face_box") != NULL);
+    assert(cJSON_GetObjectItem(camera, "face_confidence")->valuedouble > 0.8);
+    cJSON_Delete(json);
+    cJSON_free(encoded);
+    sample = observation();
     sample.camera_ok = false;
     sample.depth_ok = false;
     encoded = telemetry_encode(&sample, "sample-boot", "bed-01");
@@ -146,11 +161,19 @@ int main(int argc, char **argv)
                             "\"bed_id\":\"bed-01\",\"destination_url\":\"\",\"device_key\":\"\"}";
     assert(monitor_settings_decode(provision, &empty, &updated, NULL) == ESP_OK);
     assert(updated.tft_mirror_x == 0 && updated.face_model == MONITOR_FACE_MSRMNP);
-    const char *clear = "{\"wifi_ssid\":\"test-network\",\"wifi_password\":\"\",\"bed_id\":\"\","
-                        "\"destination_url\":\"\",\"device_key\":\"\",\"clear_device_key\":true}";
+    char clear[512];
+    snprintf(clear, sizeof(clear), "%.*s,\"clear_device_key\":true}",
+             (int)strlen(update) - 1, update);
     assert(monitor_settings_decode(clear, &current, &updated, NULL) == ESP_OK);
+    assert(updated.bed_id[0] && updated.destination_url[0]);
     assert(!monitor_settings_ready(&updated));
-    assert(!updated.device_key[0]);
+    const char empty_key[sizeof(updated.device_key)] = {0};
+    assert(!memcmp(updated.device_key, empty_key, sizeof(empty_key)));
+
+    monitor_settings_t previously_cleared = current;
+    previously_cleared.device_key[0] = 0;
+    assert(monitor_settings_decode(update, &previously_cleared, &updated, NULL) == ESP_OK);
+    assert(!memcmp(updated.device_key, empty_key, sizeof(empty_key)));
     const char *invalid[] = {"http://edge.example/v1/measurements",
                              "https://user:secret@edge.example/v1/measurements",
                              "https://edge.example:bad/v1/measurements",

@@ -13,6 +13,10 @@ typedef struct
     bool camera_ok;
     bool face_detected;
     double face_area_px2;
+    double face_confidence;
+    int face_box[4];
+    int face_landmarks[10];
+    bool face_landmarks_valid;
     int64_t depth_timestamp;
     bool depth_ok;
     int16_t distance[64];

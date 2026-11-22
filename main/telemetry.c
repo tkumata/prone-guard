@@ -79,6 +79,38 @@ char *telemetry_encode(const sensor_observation_t *o, const char *boot_id, const
              o->camera_ok ? cJSON_CreateNumber(o->camera_timestamp) : cJSON_CreateNull()) &&
          add(camera, "face_detected",
              o->camera_ok ? cJSON_CreateNumber(o->face_detected ? 1 : 0) : cJSON_CreateNull());
+    if (o->camera_ok && o->face_detected)
+    {
+        bool box_valid = isfinite(o->face_confidence) &&
+                         o->face_confidence >= 0.0 && o->face_confidence <= 1.0 &&
+                         o->face_box[0] >= 0 && o->face_box[1] >= 0 &&
+                         o->face_box[2] <= 320 && o->face_box[3] <= 240 &&
+                         o->face_box[2] > o->face_box[0] &&
+                         o->face_box[3] > o->face_box[1];
+        if (box_valid)
+            ok = ok && cJSON_AddNumberToObject(camera, "face_confidence", o->face_confidence) &&
+             add(camera, "face_box", cJSON_CreateIntArray(o->face_box, 4));
+        if (box_valid && o->face_landmarks_valid)
+        {
+            cJSON *points = cJSON_CreateArray();
+            if (!points)
+                ok = false;
+            for (int i = 0; i < 5 && points; ++i)
+            {
+                int point[2] = {o->face_landmarks[2 * i], o->face_landmarks[2 * i + 1]};
+                if (point[0] < 0 || point[0] > 320 || point[1] < 0 || point[1] > 240 ||
+                    !cJSON_AddItemToArray(points, cJSON_CreateIntArray(point, 2)))
+                {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok)
+                ok = add(camera, "face_landmarks", points);
+            else
+                cJSON_Delete(points);
+        }
+    }
     snprintf(number, sizeof(number), "%.2f", o->face_detected ? o->face_area_px2 : 0.0);
     ok =
         ok &&

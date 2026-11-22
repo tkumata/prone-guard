@@ -13,9 +13,9 @@ use anyhow::Result;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, FromRequest, Request, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde_json::json;
@@ -54,6 +54,20 @@ pub fn router(app: Arc<App>) -> Router {
         .with_state(app)
 }
 
+struct TimedBody<T>(T);
+
+impl<S: Sync, T: FromRequest<S>> FromRequest<S> for TimedBody<T> {
+    type Rejection = Response;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        tokio::time::timeout(Duration::from_secs(5), T::from_request(request, state))
+            .await
+            .map_err(|_| StatusCode::REQUEST_TIMEOUT.into_response())?
+            .map(Self)
+            .map_err(IntoResponse::into_response)
+    }
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PairingCheck {
@@ -66,7 +80,7 @@ struct PairingCheck {
 async fn pairing_check(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
-    Json(check): Json<PairingCheck>,
+    TimedBody(Json(check)): TimedBody<Json<PairingCheck>>,
 ) -> impl IntoResponse {
     let Some(authorization) = headers
         .get("Authorization")
@@ -134,7 +148,7 @@ async fn health(State(app): State<Arc<App>>) -> impl IntoResponse {
 async fn receive(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
-    body: Bytes,
+    TimedBody(body): TimedBody<Bytes>,
 ) -> impl IntoResponse {
     let Some(authorization) = headers
         .get("Authorization")
@@ -223,31 +237,50 @@ pub async fn judge(
         }
     })
     .await;
+    let mut quality = None;
+    let mut candidate_intervals = None;
     let mut result = match rows {
-        Ok(Ok(rows)) => match measurement::prepare_window(rows, end) {
-            Ok(_) if key.is_none() => json!({"status":"unjudgeable","reason":"jev_not_configured"}),
-            Ok(window) => match jev::request(&window, end, &device.installation) {
-                Ok(request) => match tokio::time::timeout(
-                    Duration::from_secs(30),
-                    jev::classify(&client, key.as_ref().as_ref().unwrap(), &request),
-                )
-                .await
-                {
-                    Ok(Ok(result)) if now() < end + measurement::PERIOD => {
-                        app.jev_available.store(true, Ordering::Relaxed);
-                        result
+        Ok(Ok(rows)) => {
+            quality = Some(json!(measurement::quality_report(&rows, end)));
+            match measurement::prepare_window(rows, end) {
+                Ok(_) if key.is_none() => json!({"status":"unjudgeable","reason":"jev_not_configured"}),
+                Ok(window) => {
+                    candidate_intervals = Some(json!(jev::depth_change_candidates(&window)));
+                    match jev::request(&window, end, &device.installation) {
+                    Ok(request) => match tokio::time::timeout(
+                        Duration::from_secs(30),
+                        jev::classify(&client, key.as_ref().as_ref().unwrap(), &request),
+                    )
+                    .await
+                    {
+                        Ok(Ok(result)) if now() < end + measurement::PERIOD => {
+                            app.jev_available.store(true, Ordering::Relaxed);
+                            result
+                        }
+                        Ok(Err(error)) => {
+                            app.jev_available.store(false, Ordering::Relaxed);
+                            eprintln!("{}", json!({"event":"jev_error","bed_id":bed,"error":error.to_string()}));
+                            json!({"status":"unjudgeable","reason":"jev_failed"})
+                        }
+                        _ => {
+                            app.jev_available.store(false, Ordering::Relaxed);
+                            json!({"status":"unjudgeable","reason":"jev_timeout_or_expired"})
+                        }
+                    },
+                    Err(_) => json!({"status":"unjudgeable","reason":"input_too_large"}),
                     }
-                    _ => {
-                        app.jev_available.store(false, Ordering::Relaxed);
-                        json!({"status":"unjudgeable","reason":"jev_failed_or_expired"})
-                    }
-                },
-                Err(_) => json!({"status":"unjudgeable","reason":"input_too_large"}),
-            },
-            Err(error) => json!({"status":"unjudgeable","reason":error.to_string()}),
-        },
+            }
+                Err(error) => json!({"status":"unjudgeable","reason":error.to_string()}),
+            }
+        }
         _ => json!({"status":"unjudgeable","reason":"storage_error"}),
     };
+    if let Some(report) = quality {
+        result["quality"] = report;
+    }
+    if let Some(intervals) = candidate_intervals {
+        result["depth_motion_candidates"] = intervals;
+    }
     result["requested_model"] = json!(jev::MODEL);
     result["question_version"] = json!(jev::QUESTION_VERSION);
     eprintln!(

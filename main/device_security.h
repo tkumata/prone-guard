@@ -13,5 +13,7 @@ typedef struct
 
 esp_err_t device_storage_init(void);
 esp_err_t device_security_load(device_security_t *security);
+esp_err_t device_security_authorize_provision(device_security_t *security,
+                                              const unsigned char digest[32]);
 esp_err_t device_provision(const char *json);
 bool device_authorize(httpd_req_t *req, const device_security_t *security);

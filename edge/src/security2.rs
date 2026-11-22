@@ -13,7 +13,7 @@ use srp::{
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-// Wire tags match ESP-IDF 6.0.3 components/protocomm/proto/{session,sec2}.proto.
+// Wire tags match ESP-IDF 6.1.1 components/protocomm/proto/{session,sec2}.proto.
 #[derive(Clone, Message)]
 struct Session {
     #[prost(uint32, tag = "2")]

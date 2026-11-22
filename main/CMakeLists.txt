@@ -1,6 +1,6 @@
 idf_component_register(
     SRCS "main.c" "prone_inference_bridge.cpp" "monitor_settings.c" "monitor_settings_json.c"
-         "device_security.c" "pairing_frame.c" "pairing_usb.c" "telemetry.c" "depth_sensor.c"
+         "device_security.c" "device_security_store.c" "pairing_frame.c" "pairing_usb.c" "telemetry.c" "depth_sensor.c"
          "depth_map.c" "tft_display.c" "edge_sender.c" "vendor/vl53l5cx/vl53l5cx_api.c"
     INCLUDE_DIRS "." "vendor/vl53l5cx"
     REQUIRES esp_https_server esp_http_client esp_driver_i2c esp_driver_spi esp_driver_gpio nvs_flash nvs_sec_provider

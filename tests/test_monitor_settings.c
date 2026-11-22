@@ -1,6 +1,7 @@
 #include "monitor_settings.h"
 #include "nvs.h"
 #include <assert.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -155,5 +156,34 @@ int main(void)
     assert(loaded.tft_mirror_x == 0 && loaded.face_model == MONITOR_FACE_MSRMNP);
     expected.tft_mirror_x = 2;
     assert(monitor_settings_save(&expected) == ESP_ERR_INVALID_ARG);
+    const char *clear = "{\"wifi_ssid\":\"saved-network\",\"wifi_password\":\"\","
+                        "\"bed_id\":\"bed-01\",\"destination_url\":\"https://edge.example/v1/measurements\","
+                        "\"device_key\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+                        "\"clear_device_key\":true}";
+    monitor_settings_t updated;
+    assert(monitor_settings_ready(&loaded));
+    assert(monitor_settings_decode(clear, &loaded, &updated, NULL) == ESP_OK);
+    assert(!monitor_settings_ready(&updated));
+    assert(monitor_settings_save(&updated) == ESP_OK);
+    const char empty_key[sizeof(updated.device_key)] = {0};
+    const size_t key_offset = offsetof(monitor_settings_t, device_key);
+    assert(!memcmp(stored + key_offset, empty_key, sizeof(empty_key)));
+
+    // Older firmware left the tail of the token in each supported settings layout.
+    const size_t supported_sizes[] = {741, 742, sizeof(loaded)};
+    for (size_t i = 0; i < sizeof(supported_sizes) / sizeof(supported_sizes[0]); ++i)
+    {
+        stored_size = supported_sizes[i];
+        memcpy(stored, &before, stored_size);
+        stored[key_offset] = 0;
+        unsigned previous_commits = commits;
+        assert(monitor_settings_load(&loaded) == ESP_OK);
+        assert(!monitor_settings_ready(&loaded));
+        assert(!memcmp(loaded.device_key, empty_key, sizeof(empty_key)));
+        assert(commits == previous_commits && stored_size == supported_sizes[i]);
+        assert(monitor_settings_save(&loaded) == ESP_OK);
+        assert(stored_size == sizeof(loaded));
+        assert(!memcmp(stored + key_offset, empty_key, sizeof(empty_key)));
+    }
     puts("Settings NVS compatibility, round-trip and failure tests passed");
 }

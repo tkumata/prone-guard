@@ -452,6 +452,18 @@ static void sensor_task(void *arg)
                                           : 0.0;
                 observation.face_detected = observation.face_area_px2 > 0.0;
                 observation.camera_ok = !detected || observation.face_detected;
+                if (observation.face_detected)
+                {
+                    observation.face_confidence = box.confidence;
+                    observation.face_box[0] = box.x0;
+                    observation.face_box[1] = box.y0;
+                    observation.face_box[2] = box.x1;
+                    observation.face_box[3] = box.y1;
+                    observation.face_landmarks_valid = box.landmarks_valid;
+                    if (box.landmarks_valid)
+                        memcpy(observation.face_landmarks, box.landmarks,
+                               sizeof(observation.face_landmarks));
+                }
             }
             else if (!frame)
             {

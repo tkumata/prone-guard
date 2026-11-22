@@ -157,8 +157,8 @@ esp_err_t monitor_settings_decode(const char *json, const monitor_settings_t *cu
                  field(root, "destination_url", updated->destination_url,
                        sizeof(updated->destination_url), false) &&
                  field(root, "device_key", updated->device_key, sizeof(updated->device_key), true);
-    if (cJSON_IsTrue(clear))
-        updated->device_key[0] = 0;
+    if (cJSON_IsTrue(clear) || !updated->device_key[0])
+        memset(updated->device_key, 0, sizeof(updated->device_key));
     if (mirror)
         updated->tft_mirror_x = cJSON_IsTrue(mirror);
     if (model)

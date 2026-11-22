@@ -31,26 +31,6 @@ esp_err_t device_storage_init(void)
     return nvs_flash_init_partition("nvs");
 }
 
-esp_err_t device_security_load(device_security_t *security)
-{
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open_from_partition("secure_nvs", "prone_guard", NVS_READONLY, &handle);
-    if (err != ESP_OK)
-        return err;
-    size_t size = sizeof(*security);
-    err = nvs_get_blob(handle, "security", security, &size);
-    nvs_close(handle);
-    if (err != ESP_OK)
-        return err;
-    if (size != sizeof(*security) || security->version != 1 ||
-        !memchr(security->certificate, 0, sizeof(security->certificate)) ||
-        !memchr(security->private_key, 0, sizeof(security->private_key)) ||
-        !memchr(security->edge_ca, 0, sizeof(security->edge_ca)) || !security->certificate[0] ||
-        !security->private_key[0] || !security->edge_ca[0])
-        return ESP_ERR_INVALID_STATE;
-    return ESP_OK;
-}
-
 static bool copy_field(const cJSON *object, const char *name, char *out, size_t capacity)
 {
     const cJSON *value = cJSON_GetObjectItemCaseSensitive(object, name);
@@ -70,15 +50,29 @@ esp_err_t device_provision(const char *json)
     monitor_settings_t updated = {0};
     esp_err_t err = ESP_ERR_INVALID_ARG;
     char *settings_json = NULL;
+    unsigned char digest[sizeof(security->admin_sha256)] = {0};
     if (!security)
     {
         err = ESP_ERR_NO_MEM;
         goto done;
     }
-    security->version = 1;
     if (!cJSON_IsObject(provision) || !cJSON_IsObject(settings) || !cJSON_IsString(admin) ||
-        strlen(admin->valuestring) != 64 || !monitor_token_valid(admin->valuestring) ||
-        !copy_field(provision, "server_certificate", security->certificate,
+        strlen(admin->valuestring) != 64 || !monitor_token_valid(admin->valuestring))
+        goto done;
+    size_t hash_length = 0;
+    if (psa_hash_compute(PSA_ALG_SHA_256, (const unsigned char *)admin->valuestring, 64,
+                         digest, sizeof(digest), &hash_length) != PSA_SUCCESS ||
+        hash_length != sizeof(digest))
+        goto done;
+    err = device_security_authorize_provision(security, digest);
+    if (err != ESP_OK)
+        goto done;
+
+    err = ESP_ERR_INVALID_ARG;
+    mbedtls_platform_zeroize(security, sizeof(*security));
+    security->version = 1;
+    memcpy(security->admin_sha256, digest, sizeof(digest));
+    if (!copy_field(provision, "server_certificate", security->certificate,
                     sizeof(security->certificate)) ||
         !copy_field(provision, "server_private_key", security->private_key,
                     sizeof(security->private_key)) ||
@@ -110,11 +104,6 @@ esp_err_t device_provision(const char *json)
     mbedtls_pk_free(&key);
     if (!valid)
         goto done;
-    size_t hash_length = 0;
-    if (psa_hash_compute(PSA_ALG_SHA_256, (const unsigned char *)admin->valuestring, 64,
-                         security->admin_sha256, 32, &hash_length) != PSA_SUCCESS ||
-        hash_length != 32)
-        goto done;
     nvs_handle_t handle;
     err = nvs_open_from_partition("secure_nvs", "prone_guard", NVS_READWRITE, &handle);
     if (err != ESP_OK)
@@ -142,6 +131,7 @@ done:
         mbedtls_platform_zeroize(security, sizeof(*security));
         free(security);
     }
+    mbedtls_platform_zeroize(digest, sizeof(digest));
     mbedtls_platform_zeroize(&updated, sizeof(updated));
     cJSON_Delete(root);
     return err;
